@@ -5,10 +5,12 @@ import json
 import logging
 import os
 import re
+import secrets
 import signal
 import subprocess
 import sys
 import time
+import urllib.parse
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -18,7 +20,7 @@ import yaml
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.responses import (
-    HTMLResponse, JSONResponse, PlainTextResponse, Response,
+    HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response,
 )
 
 logger = logging.getLogger("harvey.dashboard")
@@ -43,6 +45,131 @@ def _resolve_config_file() -> Path:
         return CONFIG_FILE
 
 app = FastAPI(title="Harvey Dashboard")
+
+
+# ── The gate ──
+#
+# Off on a loopback bind with no password set, which is the laptop case.
+# On the moment HARVEY_DASHBOARD_PASSWORD exists, and start_dashboard
+# refuses any non-loopback bind without it. Private by default: a new
+# route is behind the gate unless it is named in webauth.PUBLIC_PATHS.
+
+
+@app.middleware("http")
+async def _require_login(request: Request, call_next):
+    from harvey import webauth
+
+    if not webauth.is_enabled() or webauth.path_is_public(request.url.path):
+        return await call_next(request)
+    if webauth.cookie_is_valid(request.cookies.get(webauth.COOKIE_NAME, "")):
+        return await call_next(request)
+    if request.url.path.startswith("/api/"):
+        # A page that is polling must be told plainly, not handed HTML.
+        return JSONResponse(
+            {"success": False, "message": "Session expired. Sign in again."},
+            status_code=401)
+    return RedirectResponse("/login", status_code=303)
+
+
+LOGIN_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Harvey</title><link rel="stylesheet" href="/static/app.css">
+<style>
+  body { display:flex; align-items:center; justify-content:center;
+         min-height:100vh; margin:0; }
+  .signin { width:min(380px, 92vw); }
+  .signin h1 { font-size:22px; margin:0 0 4px; }
+  .signin p { color:var(--text-2); font-size:13px; margin:0 0 18px; }
+  .signin .err { display:none; margin-bottom:12px; }
+  .signin .err.show { display:block; }
+</style></head>
+<body><form class="signin card" onsubmit="go(event)">
+  <h1>Harvey</h1>
+  <p>This console holds contact records and can send mail in your name.</p>
+  <div class="test-result error err" id="err"></div>
+  <div class="form-group">
+    <label class="form-label" for="pw">Password</label>
+    <input class="form-input" id="pw" type="password" autocomplete="current-password" autofocus>
+  </div>
+  <button class="btn btn-primary" type="submit">Sign in</button>
+</form>
+<script>
+async function go(e) {
+  e.preventDefault();
+  const err = document.getElementById('err');
+  const r = await fetch('/api/auth/login', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({password: document.getElementById('pw').value})
+  });
+  if (r.ok) { window.location = '/'; return; }
+  let m = 'Could not sign in.';
+  try { m = (await r.json()).message || m; } catch (_) {}
+  err.textContent = m; err.classList.add('show');
+}
+</script></body></html>"""
+
+
+@app.get("/healthz")
+async def healthz():
+    """Liveness for the platform. Public, and cheap on purpose: it must not
+    query the database, or a slow query would read as a dead process and
+    get the container restarted in the middle of real work."""
+    return {"ok": True}
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page():
+    from harvey import webauth
+    if not webauth.is_enabled():
+        return RedirectResponse("/", status_code=303)
+    return LOGIN_PAGE
+
+
+@app.get("/api/auth/state")
+async def auth_state():
+    """Whether a password is required at all, for the UI to show Sign out."""
+    from harvey import webauth
+    return {"required": webauth.is_enabled()}
+
+
+@app.post("/api/auth/login")
+async def auth_login(request: Request):
+    from harvey import webauth
+
+    if not webauth.is_enabled():
+        return {"success": True, "required": False}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not webauth.password_matches(str(body.get("password") or "")):
+        # A deliberate pause: enough to make a script crawl, too small to
+        # notice when you simply mistyped.
+        await asyncio.sleep(0.5)
+        return JSONResponse(
+            {"success": False, "message": "That password is not right."},
+            status_code=401)
+
+    forwarded = request.headers.get("x-forwarded-proto", "")
+    https = request.url.scheme == "https" or forwarded.split(",")[0].strip() == "https"
+    response = JSONResponse({"success": True})
+    response.set_cookie(
+        webauth.COOKIE_NAME, webauth.issue_cookie(),
+        max_age=webauth.SESSION_HOURS * 3600,
+        httponly=True,        # JavaScript must never be able to read it
+        samesite="lax",       # survives the OAuth return from Google
+        secure=https,         # only withheld on plain http, i.e. localhost
+        path="/")
+    return response
+
+
+@app.post("/api/auth/logout")
+async def auth_logout():
+    from harvey import webauth
+    response = JSONResponse({"success": True})
+    response.delete_cookie(webauth.COOKIE_NAME, path="/")
+    return response
 
 # Harvey process tracking
 _harvey_process: subprocess.Popen | None = None
@@ -977,6 +1104,52 @@ async def gmail_status():
                             status_code=500)
 
 
+# Outstanding OAuth states for the hosted flow: issued here, returned by
+# Google, used once. Without this check anyone could hand the callback a
+# code of their choosing.
+_oauth_states: dict[str, float] = {}
+OAUTH_STATE_TTL = 900
+
+
+def _prune_oauth_states():
+    cutoff = time.time() - OAUTH_STATE_TTL
+    for key in [k for k, born in _oauth_states.items() if born < cutoff]:
+        _oauth_states.pop(key, None)
+
+
+@app.get("/oauth/google/callback")
+async def gmail_oauth_callback(request: Request):
+    """Where Google sends the person back after the consent screen.
+
+    Behind the login gate like everything else: the browser arriving here
+    is the one that started the flow, so it still carries the session.
+    """
+    from harvey.config import load_env
+    from harvey.integrations.gmail import exchange_code, hosted_redirect_uri
+
+    def done(ok: bool, message: str):
+        return RedirectResponse(
+            "/?gmail=" + ("connected" if ok else "failed") +
+            "&detail=" + urllib.parse.quote(message[:200]), status_code=303)
+
+    params = request.query_params
+    state = params.get("state", "")
+    _prune_oauth_states()
+    if not state or _oauth_states.pop(state, None) is None:
+        return done(False, "That sign-in link has expired. Press Connect Gmail again.")
+    if params.get("error"):
+        return done(False, "Google said: " + params["error"])
+    code = params.get("code", "")
+    if not code:
+        return done(False, "Google returned no authorization code.")
+
+    env = load_env()
+    ok, message = await asyncio.to_thread(
+        exchange_code, env.gmail_client_id, env.gmail_client_secret,
+        code, hosted_redirect_uri())
+    return done(ok, message)
+
+
 @app.post("/api/gmail/connect")
 async def gmail_connect():
     """Start the Google consent flow. Opens the browser on this machine."""
@@ -985,12 +1158,27 @@ async def gmail_connect():
         from harvey.config import load_env
         from harvey.integrations.gmail import run_auth_flow
 
+        from harvey.integrations.gmail import build_auth_url, hosted_redirect_uri
+
         env = load_env()
         if not (env.gmail_client_id and env.gmail_client_secret):
             return JSONResponse(
                 {"success": False,
                  "message": "Set the client ID and secret first, then save."},
                 status_code=400)
+
+        # Deployed: Google must redirect to a public URL, because the
+        # loopback flow below opens a browser on the machine running this
+        # code and listens on its localhost. On a server that is the
+        # server, and the consent screen can never find its way back.
+        hosted = hosted_redirect_uri()
+        if hosted:
+            state = secrets.token_urlsafe(16)
+            _oauth_states[state] = time.time()
+            _prune_oauth_states()
+            return {"success": True, "mode": "redirect",
+                    "url": build_auth_url(env.gmail_client_id, hosted, state)}
+
         if _gmail_connect.get("running"):
             return JSONResponse({"success": False,
                                  "message": "A connection attempt is already open."},
@@ -2602,10 +2790,67 @@ async def dashboard():
     return (WEB_DIR / "index.html").read_text(encoding="utf-8")
 
 
-def start_dashboard(host: str = "127.0.0.1", port: int = 5555):
+class InsecureBindError(RuntimeError):
+    """Raised rather than serve real contact data to the open internet."""
+
+
+def resolve_bind(host: str | None = None, port: int | None = None):
+    """Where to listen. Arguments win, then the environment, then loopback.
+
+    PORT with no prefix is read because that is what every container host
+    sets; HARVEY_PORT exists for the case where something else owns PORT.
+    """
+    resolved_host = host or os.getenv("HARVEY_HOST") or "127.0.0.1"
+    raw_port = port or os.getenv("PORT") or os.getenv("HARVEY_PORT") or 5555
+    try:
+        resolved_port = int(raw_port)
+    except (TypeError, ValueError):
+        raise InsecureBindError(f"PORT is not a number: {raw_port!r}") from None
+    return resolved_host, resolved_port
+
+
+def check_bind_is_safe(host: str):
+    """Refuse to listen beyond this machine without a password.
+
+    There is no accident here worth being relaxed about: every route serves
+    real people's contact details, and an approved email sends from your
+    mailbox. A bind to 0.0.0.0 with no password is that, published.
+    """
+    from harvey import webauth
+
+    if webauth.is_loopback(host) or webauth.is_enabled():
+        return
+    raise InsecureBindError(
+        f"Refusing to serve on {host} with no password set.\n"
+        "  This console exposes contact records and can send mail in your "
+        "name.\n"
+        "  Set HARVEY_DASHBOARD_PASSWORD (and HARVEY_SESSION_SECRET for "
+        "sessions\n"
+        "  that survive restarts), then start again."
+    )
+
+
+def start_dashboard(host: str | None = None, port: int | None = None):
     """Start the dashboard server."""
     import uvicorn
 
-    print(f"\n  Harvey Dashboard running at http://{host}:{port}")
+    from harvey import webauth
+
+    host, port = resolve_bind(host, port)
+    check_bind_is_safe(host)
+
+    gate = "password required" if webauth.is_enabled() else "no password (local only)"
+    print(f"\n  Harvey Dashboard running at http://{host}:{port}  [{gate}]")
     print("  Press Ctrl+C to stop.\n")
     uvicorn.run(app, host=host, port=port, log_level="warning")
+
+
+if __name__ == "__main__":
+    # `python -m harvey.dashboard` — the container entry point. The image's
+    # own CMD runs the heartbeat agent; a web deployment overrides it with
+    # this, and the two can also run as separate services off one image.
+    try:
+        start_dashboard()
+    except InsecureBindError as exc:
+        print("\n  " + str(exc) + "\n")
+        raise SystemExit(2)

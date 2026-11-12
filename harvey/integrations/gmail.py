@@ -17,6 +17,7 @@ rest.
 import base64
 import json
 import logging
+import os
 import time
 import webbrowser
 from email.message import EmailMessage
@@ -273,6 +274,65 @@ class GmailProvider(MailProvider):
         return False, "Token refresh or profile fetch failed"
 
 
+def hosted_redirect_uri() -> str:
+    """The redirect URI for a deployed Harvey, or "" for the laptop case.
+
+    Set GMAIL_REDIRECT_URI to the public callback, e.g.
+    https://harvey.example.com/oauth/google/callback, and add exactly that
+    string to the OAuth client in Google Cloud Console. The loopback flow
+    below cannot work off your own machine: localhost there is the server.
+    """
+    return (os.getenv("GMAIL_REDIRECT_URI") or "").strip()
+
+
+def build_auth_url(client_id: str, redirect_uri: str, state: str) -> str:
+    """Google's consent URL. access_type=offline with prompt=consent is
+    what makes Google return a refresh token rather than only an access
+    token that dies in an hour."""
+    import urllib.parse
+
+    return AUTH_URL + "?" + urllib.parse.urlencode({
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": SCOPE,
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": state,
+    })
+
+
+def exchange_code(client_id: str, client_secret: str, code: str,
+                  redirect_uri: str) -> tuple[bool, str]:
+    """Swap an authorization code for a refresh token and store it.
+
+    Returns (ok, message). The message is shown to a person, so it says
+    what to do rather than just what failed.
+    """
+    try:
+        resp = httpx.post(TOKEN_URL, data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": redirect_uri,
+        }, timeout=30)
+    except httpx.HTTPError as e:
+        return False, f"Could not reach Google: {e}"
+    if resp.status_code != 200:
+        return False, f"Token exchange failed ({resp.status_code}): {resp.text[:200]}"
+    data = resp.json()
+    if not data.get("refresh_token"):
+        return False, ("Google returned no refresh token. Remove Harvey from "
+                       "your account's third-party access list and retry.")
+    _save_token({
+        "refresh_token": data["refresh_token"],
+        "scope": data.get("scope", SCOPE),
+        "obtained_at": int(time.time()),
+    })
+    return True, "Gmail authorized."
+
+
 def run_auth_flow(client_id: str, client_secret: str) -> bool:
     """One-time OAuth (installed-app loopback). Blocks until the browser
     round-trip completes; stores the refresh token for GmailProvider."""
@@ -288,15 +348,7 @@ def run_auth_flow(client_id: str, client_secret: str) -> bool:
 
     state = secrets.token_urlsafe(16)
     redirect_uri = f"http://localhost:{LOOPBACK_PORT}"
-    auth_url = AUTH_URL + "?" + urllib.parse.urlencode({
-        "client_id": client_id,
-        "redirect_uri": redirect_uri,
-        "response_type": "code",
-        "scope": SCOPE,
-        "access_type": "offline",
-        "prompt": "consent",
-        "state": state,
-    })
+    auth_url = build_auth_url(client_id, redirect_uri, state)
 
     result: dict = {}
     done = threading.Event()
@@ -335,25 +387,10 @@ def run_auth_flow(client_id: str, client_secret: str) -> bool:
         print(f"  Authorization failed: {result.get('error') or 'no code returned'}")
         return False
 
-    resp = httpx.post(TOKEN_URL, data={
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "code": result["code"],
-        "grant_type": "authorization_code",
-        "redirect_uri": redirect_uri,
-    }, timeout=30)
-    if resp.status_code != 200:
-        print(f"  Token exchange failed ({resp.status_code}): {resp.text[:200]}")
+    ok, message = exchange_code(
+        client_id, client_secret, result["code"], redirect_uri)
+    if not ok:
+        print(f"  {message}")
         return False
-    data = resp.json()
-    if not data.get("refresh_token"):
-        print("  Google returned no refresh token. Remove Harvey from your"
-              " account's third-party access list and retry.")
-        return False
-    _save_token({
-        "refresh_token": data["refresh_token"],
-        "scope": data.get("scope", SCOPE),
-        "obtained_at": int(time.time()),
-    })
     print(f"  ✓ Gmail authorized. Token stored at {TOKEN_FILE}")
     return True

@@ -2605,13 +2605,48 @@ async function loadGmailState() {
 
 async function gmailConnect() {
   const d = await contactApi('/api/gmail/connect', {method: 'POST'});
-  if (d && d.success) {
-    showToast('Approve Harvey in the browser tab that just opened.', 'success');
-    loadGmailState();
-  } else {
+  if (!d || !d.success) {
     showToast((d && d.message) || 'Could not start the connection.', 'error');
+    return;
   }
+  // Deployed: Google has to send the browser back to a public URL, so we
+  // navigate there. On a laptop the server opens a tab for you instead.
+  if (d.mode === 'redirect' && d.url) { window.location = d.url; return; }
+  showToast('Approve Harvey in the browser tab that just opened.', 'success');
+  loadGmailState();
 }
+
+// Coming back from Google: say what happened, then tidy the URL so a
+// refresh does not replay a stale result.
+(function gmailReturn() {
+  const q = new URLSearchParams(window.location.search);
+  const outcome = q.get('gmail');
+  if (!outcome) return;
+  const detail = q.get('detail') || '';
+  showToast(outcome === 'connected'
+    ? 'Gmail connected.'
+    : ('Gmail not connected. ' + detail), outcome === 'connected' ? 'success' : 'error');
+  q.delete('gmail'); q.delete('detail');
+  const rest = q.toString();
+  window.history.replaceState({}, '', window.location.pathname + (rest ? '?' + rest : ''));
+})();
+
+// Sign out appears only when a password is actually in force.
+(async function signOutControl() {
+  let state = null;
+  try { state = await (await fetch('/api/auth/state')).json(); } catch (e) { return; }
+  if (!state || !state.required) return;
+  const host = document.querySelector('.header-controls');
+  if (!host) return;
+  const btn = document.createElement('button');
+  btn.className = 'btn btn-secondary btn-sm';
+  btn.textContent = 'Sign out';
+  btn.onclick = async () => {
+    await fetch('/api/auth/logout', {method: 'POST'});
+    window.location = '/login';
+  };
+  host.appendChild(btn);
+})();
 
 async function gmailDisconnect() {
   if (!confirm('Disconnect Gmail? This revokes the token at Google and deletes it here. Approved mail will stop sending until you reconnect.')) return;
