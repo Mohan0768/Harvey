@@ -1,3 +1,4 @@
+
 [build-system]
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
@@ -9,7 +10,15 @@ description = "Autonomous AI sales agent. Always Be Closing."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-keywords = ["sales", "ai-agent", "cold-email", "prospecting", "autonomous-agent", "claude"]
+keywords = [
+    "sales",
+    "ai-agent",
+    "cold-email",
+    "prospecting",
+    "autonomous-agent",
+    "claude"
+]
+
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -18,6 +27,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Office/Business",
 ]
+
 # Keep in sync with requirements.txt (used by Docker builds).
 dependencies = [
     "pyyaml>=6.0.1,<7",
@@ -32,7 +42,6 @@ dependencies = [
     "pytz>=2024.1",
     "fastapi>=0.115,<1",
     "uvicorn>=0.34,<1",
-    # Contact list uploads on the Discover tab.
     "openpyxl>=3.1,<4",
     "xlrd>=2.0,<3",
     "python-multipart>=0.0.9,<1",
@@ -55,7 +64,10 @@ harvey = "harvey.cli:main"
 [tool.setuptools.packages.find]
 include = ["harvey*"]
 
-# The dashboard's HTML/CSS/JS are real files served from disk, and its fonts
-# are vendored so a local tool renders correctly with the network off.
+# Dashboard HTML/CSS/JS and vendored fonts.
 [tool.setuptools.package-data]
 harvey = ["web/*", "web/fonts/*"]
+
+# Vercel FastAPI configuration.
+[tool.vercel]
+entrypoint = "harvey.agents.handler:Handler"
