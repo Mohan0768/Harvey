@@ -35,11 +35,12 @@ host actually takes.
 
 Why it does not raise
 ---------------------
-Raising here is safe but useless. The function dies at import, every
-path returns a blank 500, and the only way to learn which of a dozen
-causes it was is the platform's runtime log. Refusing with a page that
-names the missing variable costs nothing and keeps the same promise: no
-route below serves data.
+Raising here is safe but useless. The function dies at import, every path
+returns a blank 500, and nothing distinguishes a missing password from a
+missing dependency — the only way to tell is the platform's runtime log,
+which is exactly what you do not have when someone else deployed it.
+Refusing with a page that names the cause costs nothing and keeps the
+same promise: while it is showing, no route serves data.
 """
 
 import os
@@ -57,7 +58,7 @@ _STYLE = (
 )
 
 
-def _page(heading: str, detail: str, fix: str) -> bytes:
+def _page(heading: str, detail: str, fix: str) -> str:
     import html
 
     return (
@@ -75,51 +76,41 @@ def _page(heading: str, detail: str, fix: str) -> bytes:
         "<p style='color:#777;font-size:14px'>No data is served while this "
         "message is showing.</p>"
         "</body></html>"
-    ).encode("utf-8")
+    )
 
 
 def _refusing_app(heading: str, detail: str, fix: str):
-    """A minimal ASGI app that explains itself and serves nothing else.
+    """A tiny app that explains itself and serves nothing else.
 
-    Written against the raw ASGI interface on purpose: whatever broke the
-    real app must not be able to break the thing reporting it.
+    Built with Starlette rather than a bare ASGI callable. A host decides
+    what to do with ``app`` by inspecting it, and a plain function is not
+    reliably recognised as an application; being unrecognised fails the
+    same way the original crash did, with a blank 500, which would hide
+    the very message this exists to show. Starlette already sits under
+    FastAPI, so it costs no new dependency.
     """
+    from starlette.applications import Starlette
+    from starlette.responses import HTMLResponse, PlainTextResponse
+    from starlette.routing import Route
+
     html_body = _page(heading, detail, fix)
-    text_body = (heading + "\n\n" + detail + "\n\n" + fix + "\n").encode("utf-8")
+    text_body = heading + "\n\n" + detail + "\n\n" + fix + "\n"
+    headers = {"cache-control": "no-store", "x-harvey-state": "unconfigured"}
 
-    async def app(scope, receive, send):
-        if scope["type"] == "lifespan":
-            while True:
-                message = await receive()
-                if message["type"] == "lifespan.startup":
-                    await send({"type": "lifespan.startup.complete"})
-                elif message["type"] == "lifespan.shutdown":
-                    await send({"type": "lifespan.shutdown.complete"})
-                    return
-            return
-        if scope["type"] != "http":
-            return
-
-        path = scope.get("path", "/")
+    async def explain(request):
+        path = request.url.path
         wants_text = path.startswith("/api/") or path.endswith(
             (".json", ".csv", ".js", ".css"))
-        body = text_body if wants_text else html_body
-        ctype = ("text/plain; charset=utf-8" if wants_text
-                 else "text/html; charset=utf-8")
         # 503: the service exists and is not ready, which is exactly true.
-        await send({
-            "type": "http.response.start",
-            "status": 503,
-            "headers": [
-                (b"content-type", ctype.encode()),
-                (b"content-length", str(len(body)).encode()),
-                (b"cache-control", b"no-store"),
-                (b"x-harvey-state", b"unconfigured"),
-            ],
-        })
-        await send({"type": "http.response.body", "body": body})
+        if wants_text:
+            return PlainTextResponse(text_body, status_code=503,
+                                     headers=headers)
+        return HTMLResponse(html_body, status_code=503, headers=headers)
 
-    return app
+    return Starlette(routes=[
+        Route("/{path:path}", explain,
+              methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"]),
+    ])
 
 
 def _build():

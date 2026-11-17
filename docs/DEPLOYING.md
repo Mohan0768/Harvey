@@ -50,8 +50,16 @@ Never commit any of these. `.env` is gitignored and must stay that way.
 5. Deploy, then open the URL. You should get the login screen, and the
    password you set should let you in to an empty console.
 
-If the function errors with *"Refusing to serve"*, the password variable is
-missing or empty — that is the guard working, not a bug.
+### If it is not the login screen
+
+The deployment tells you what is wrong rather than returning a blank error.
+A **503** with *"Set a dashboard password"* means `HARVEY_DASHBOARD_PASSWORD`
+is missing or empty — the guard working, not a bug. A 503 saying *"Harvey
+failed to start"* or *"failed to load"* names the exception instead, which
+means the problem is an import, usually a dependency missing from
+`api/requirements.txt`.
+
+Either way no route serves data while that page is showing.
 
 ## A caution about the repository
 
