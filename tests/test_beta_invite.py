@@ -361,6 +361,20 @@ async def test_junk_from_the_model_keeps_the_composed_email():
 
 @pytest.fixture
 def client(monkeypatch):
+    """A dashboard with its own database and its own configuration.
+
+    Pinning the config matters as much as pinning the database. The routes
+    call load_config(), which finds whatever harvey.local.yaml the machine
+    happens to have, so without this the assertions below test the
+    developer's own setup: they passed on a checkout carrying a real
+    config and failed on a fresh clone, where the same code composes an
+    email signed by the untrained template instead.
+    """
+    import harvey.config as config_module
+
+    cfg = make_config(founder_name="KK")
+    monkeypatch.setattr(config_module, "load_config", lambda *a, **k: cfg)
+
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         db = Path(tmp) / "harvey.db"
         monkeypatch.setattr(dash, "DB_PATH", db)
