@@ -1,0 +1,21 @@
+# Vercel build only. Deliberately not the root requirements.txt.
+#
+# Playwright is the reason this file exists: it carries browser binaries
+# that do not fit inside a serverless bundle, and nothing the dashboard
+# serves uses it (LinkedIn prospecting and deep crawling need a host with
+# a real browser). uvicorn is absent for the same kind of reason — the
+# platform provides the server, so the app is imported, never run.
+pyyaml>=6.0.1,<7
+python-dotenv>=1.0.1,<2
+httpx>=0.27.0,<1
+beautifulsoup4>=4.12.3,<5
+dnspython>=2.4.2,<3
+aiosmtplib>=3.0.1,<4
+aiosqlite>=0.19,<1
+pydantic>=2.5,<3
+pytz>=2024.1
+fastapi>=0.115,<1
+openpyxl>=3.1,<4
+xlrd>=2.0,<3
+python-multipart>=0.0.9,<1
+anthropic>=0.40,<3

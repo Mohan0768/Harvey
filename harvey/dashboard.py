@@ -27,12 +27,12 @@ from fastapi.responses import (
 
 logger = logging.getLogger("harvey.dashboard")
 
-from harvey.paths import PROJECT_ROOT  # noqa: E402
-DB_PATH = PROJECT_ROOT / "data" / "harvey.db"
+from harvey.paths import DATA_DIR, PROJECT_ROOT  # noqa: E402
+DB_PATH = DATA_DIR / "harvey.db"
 ENV_FILE = PROJECT_ROOT / ".env"
 CONFIG_FILE = PROJECT_ROOT / "harvey.yaml"
-PID_FILE = PROJECT_ROOT / "data" / "harvey.pid"
-LOG_FILE = PROJECT_ROOT / "data" / "harvey.log"
+PID_FILE = DATA_DIR / "harvey.pid"
+LOG_FILE = DATA_DIR / "harvey.log"
 
 
 def _resolve_config_file() -> Path:

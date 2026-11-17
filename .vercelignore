@@ -1,0 +1,14 @@
+# Keep the bundle small and keep local state off a public deployment.
+data/
+tests/
+docs/
+.venv/
+__pycache__/
+*.pyc
+Dockerfile
+docker-compose.yml
+harvey.local.yaml
+.env
+prospects.csv
+outreach/
+scripts/
