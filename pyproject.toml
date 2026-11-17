@@ -52,6 +52,16 @@ dev = [
     "pytest>=8.0,<9",
     "pytest-asyncio>=0.23,<1",
 ]
+# brain.provider "anthropic" (a Claude API key) and "google_cloud" (Claude
+# Models on Google Cloud) both go through this SDK. The claude and codex
+# providers shell out to a CLI and need none of it, so a plain install
+# stays light: pip install -e ".[api]" when you want a key-based provider.
+api = [
+    "anthropic>=0.40,<3",
+]
+google-cloud = [
+    "anthropic[google_cloud]>=0.40,<3",
+]
 
 [project.urls]
 Homepage = "https://github.com/ethanplusai/harvey"

@@ -6,6 +6,7 @@ pin down are the ones that make it safe to put anywhere but a laptop.
 """
 
 import tempfile
+import urllib.parse
 import time
 from pathlib import Path
 
@@ -178,14 +179,50 @@ def test_callback_refuses_an_unknown_state(client, monkeypatch):
 
 def test_callback_state_is_single_use(client, monkeypatch):
     monkeypatch.delenv("HARVEY_DASHBOARD_PASSWORD", raising=False)
-    dash._oauth_states["s1"] = time.time()
-    first = client.get("/oauth/google/callback?error=access_denied&state=s1",
+    monkeypatch.setenv("HARVEY_SESSION_SECRET", "oauth-test-secret")
+    state = dash._issue_oauth_state()
+
+    first = client.get("/oauth/google/callback?error=access_denied&state=" + state,
                        follow_redirects=False)
     assert "gmail=failed" in first.headers["location"]
-    assert "s1" not in dash._oauth_states
-    second = client.get("/oauth/google/callback?code=x&state=s1",
+
+    second = client.get("/oauth/google/callback?code=x&state=" + state,
                         follow_redirects=False)
-    assert "expired" in second.headers["location"]
+    detail = urllib.parse.unquote(second.headers["location"])
+    assert "already been used" in detail
+
+
+def test_a_restart_does_not_invalidate_a_sign_in_in_progress(client, monkeypatch):
+    """The state used to live in a dict. Any restart between pressing
+    Connect and returning from Google silently killed a sign-in that had
+    actually worked."""
+    monkeypatch.delenv("HARVEY_DASHBOARD_PASSWORD", raising=False)
+    monkeypatch.setenv("HARVEY_SESSION_SECRET", "oauth-test-secret")
+    state = dash._issue_oauth_state()
+
+    # Everything a restart would clear.
+    dash._used_oauth_states.clear()
+
+    accepted, why = dash._oauth_state_ok(state)
+    assert accepted is True, why
+
+
+def test_a_state_this_harvey_did_not_issue_is_refused(monkeypatch):
+    monkeypatch.setenv("HARVEY_SESSION_SECRET", "oauth-test-secret")
+    accepted, why = dash._oauth_state_ok("1700000000.abc.deadbeef")
+    assert accepted is False
+    assert "did not come from this Harvey" in why
+
+    accepted, why = dash._oauth_state_ok("")
+    assert accepted is False
+
+
+def test_an_old_state_is_refused(monkeypatch):
+    monkeypatch.setenv("HARVEY_SESSION_SECRET", "oauth-test-secret")
+    monkeypatch.setattr(dash, "OAUTH_STATE_TTL", -1)
+    accepted, why = dash._oauth_state_ok(dash._issue_oauth_state())
+    assert accepted is False
+    assert "expired" in why
 
 
 def test_connect_returns_a_redirect_when_hosted(client, monkeypatch):

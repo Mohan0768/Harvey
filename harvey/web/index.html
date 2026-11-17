@@ -212,10 +212,12 @@
 <div class="btn-group contacts-view-toggle" style="margin-bottom:14px"><button class="btn btn-primary btn-sm" onclick="contactsView('people')">People</button><button class="btn btn-secondary btn-sm" onclick="contactsView('institutions')">Institutions</button></div>
       <a class="btn btn-secondary btn-sm" href="/api/export/prospects.csv" download>Export deliverable CSV</a>
       <a class="btn btn-secondary btn-sm" href="/api/export/prospects.csv?all=true" download>Export all</a>
+      <button class="btn btn-secondary btn-sm" id="find-contacts-btn" onclick="findContacts()">Find contacts</button>
       <button class="btn btn-primary btn-sm" onclick="openComposer()">Write Email</button>
       <button class="btn btn-primary btn-sm" onclick="openCustomEmail()">Custom Email</button>
     </div>
   </div>
+  <div id="find-contacts-note"></div>
   <div class="card" style="margin-bottom:12px">
     <div class="form-row" style="margin-bottom:0">
       <div class="form-group" style="flex:2;margin-bottom:0">
@@ -254,13 +256,13 @@
 
 <!-- Outbox: the decisions desk -->
 <div id="outbox" class="section">
-  <div class="section-head" style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px">
+  <div class="section-head" style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap">
     <div>
       <h2>Outbox</h2>
       <p>Every outgoing email stops here. Read one, decide, move on &mdash;
          <kbd>A</kbd> approve, <kbd>R</kbd> reject, <kbd>J</kbd>/<kbd>K</kbd> to move.</p>
     </div>
-    <div style="display:flex;gap:8px;flex-shrink:0" id="outbox-actions"></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end" id="outbox-actions"></div>
   </div>
   <div id="outbox-banner"></div>
   <div id="outbox-desk"></div>
@@ -298,6 +300,37 @@
 <div id="settings" class="section">
   <div class="section-head"><h2>Settings</h2><p>Credentials are stored locally in <span style="font-family:var(--mono);font-size:12px">.env</span> — never sent anywhere except the services themselves.</p></div>
 
+  <div class="card" id="brain-google-cloud">
+    <h2>Claude access</h2>
+    <p class="lede">Where Harvey does its thinking. An API key is the short route: one value and nothing else to set up. Google Cloud is for when billing and access have to sit inside your own project, and has no API key at all, because the credential is Google's.</p>
+    <div id="brain-state"></div>
+    <div class="form-group"><label class="form-label" for="brain-provider">How Harvey reaches Claude</label>
+      <select class="form-input" id="brain-provider" onchange="brainProviderChanged()">
+        <option value="anthropic">Claude API key</option>
+        <option value="google_cloud">Claude on Google Cloud</option>
+        <option value="claude">Claude Code CLI (needs an interactive sign-in)</option>
+      </select></div>
+    <div class="form-group" id="brain-key-row"><label class="form-label" for="brain-api-key">API key</label>
+      <div class="form-row"><div class="form-group" style="margin-bottom:0">
+        <input type="password" class="form-input" id="brain-api-key" placeholder="sk-ant-..." autocomplete="off"></div>
+        <button class="btn btn-secondary btn-sm" onclick="toggleVisibility('brain-api-key')">Show</button></div>
+      <p class="lede" style="margin-top:6px">From console.anthropic.com, under API keys. Stored in <span style="font-family:var(--mono);font-size:12px">.env</span> and never echoed back.</p></div>
+    <div id="brain-gc-rows">
+    <div class="form-group"><label class="form-label" for="gc-project">Project ID</label>
+      <input type="text" class="form-input" id="gc-project" placeholder="my-project-123456" autocomplete="off"></div>
+    <div class="form-group"><label class="form-label" for="gc-workspace">Workspace ID</label>
+      <input type="text" class="form-input" id="gc-workspace" placeholder="wrkspc_..." autocomplete="off"></div>
+    <div class="form-group"><label class="form-label" for="gc-credentials">Service account key file</label>
+      <input type="text" class="form-input" id="gc-credentials" placeholder="C:\Users\you\.config\harvey-gcloud-key.json" autocomplete="off">
+      <p class="lede" style="margin-top:6px">The path to the JSON key, not its contents. Leave blank if you signed in with <span style="font-family:var(--mono);font-size:12px">gcloud auth application-default login</span> instead.</p></div>
+    </div>
+    <div class="btn-group">
+      <button class="btn btn-secondary btn-sm" onclick="saveBrainAccess()">Save</button>
+      <button class="btn btn-primary btn-sm" onclick="testBrain()">Test the connection</button>
+    </div>
+    <div id="brain-test-result"></div>
+  </div>
+
   <div class="card" id="gmail-integration">
     <h2>Email Integration</h2>
     <p class="lede">Connect the mailbox Harvey sends approved email from. The consent screen opens in your browser on this machine; the refresh token is stored locally and never leaves it.</p>
@@ -325,6 +358,22 @@
   <div class="card" id="export-only-note" style="display:none">
     <h2>Nothing to configure</h2>
     <p class="lede">This is an export-only setup: Harvey finds the people and writes the copy, you send from your own mailbox. No mail provider and no verification key are used, so the forms for them are hidden.<br><br>To have Harvey send for you, set <span style="font-family:var(--mono);font-size:12px">channels.email.enabled: true</span> in <span style="font-family:var(--mono);font-size:12px">harvey.local.yaml</span> and reload this page.</p>
+  </div>
+
+  <div class="card" id="discovery-settings">
+    <h2>Lead Discovery</h2>
+    <p class="lede">Where Harvey looks for new institutions. Without one of
+      these it falls back to OpenStreetMap, which maps shopfronts by trade and
+      has no category for a university, so a run returns nothing.</p>
+    <div id="discovery-keys-state"></div>
+    <div class="form-group"><label class="form-label" for="serper-key">Serper API key</label>
+      <div class="form-row"><div class="form-group" style="margin-bottom:0">
+        <input type="password" class="form-input" id="serper-key" placeholder="2,500 searches free, no card" autocomplete="off"></div>
+        <button class="btn btn-secondary btn-sm" onclick="toggleVisibility('serper-key')">Show</button></div>
+      <p class="lede">Get one at <span style="font-family:var(--mono);font-size:12px">serper.dev</span>. Google results with rank positions.</p></div>
+    <div class="btn-group">
+      <button class="btn btn-primary btn-sm" onclick="saveDiscoveryKeys()">Save discovery key</button>
+    </div>
   </div>
 
   <div class="card" id="sending-settings">

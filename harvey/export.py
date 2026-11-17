@@ -20,6 +20,11 @@ CSV_COLUMNS = [
     "email", "first_name", "last_name", "company_name", "title",
     "website", "linkedin_url", "industry", "personalization",
     "email_status", "score", "seniority", "source", "status", "created_at",
+    # Everything else the Contacts table shows, appended rather than
+    # inserted: the order above is what sequencers auto-map against, and
+    # moving those columns would break an import that works today.
+    "name", "department", "category", "phone", "phone_verified",
+    "email_verified", "company_size", "updated_at",
 ]
 
 DEFAULT_EMAIL_STATUSES = ["verified", "risky"]
@@ -65,12 +70,16 @@ async def collect_prospects(
         async with db.execute(sql, params) as cursor:
             rows = [dict(r) for r in await cursor.fetchall()]
 
+    from harvey.segments import label as category_label
+
     out = []
     for r in rows:
+        first = r.get("first_name", "") or ""
+        last = r.get("last_name", "") or ""
         out.append({
             "email": r.get("email", ""),
-            "first_name": r.get("first_name", ""),
-            "last_name": r.get("last_name", ""),
+            "first_name": first,
+            "last_name": last,
             "company_name": r.get("company", ""),
             "title": r.get("title", ""),
             "website": r.get("source_url", ""),
@@ -83,6 +92,16 @@ async def collect_prospects(
             "source": r.get("source", ""),
             "status": r.get("status", ""),
             "created_at": r.get("created_at", ""),
+            # The columns the Contacts tab shows on screen.
+            "name": (first + " " + last).strip(),
+            "department": r.get("department", ""),
+            # Stored as a key; exported as the words on the screen.
+            "category": category_label(r.get("category", "") or ""),
+            "phone": r.get("phone", ""),
+            "phone_verified": int(bool(r.get("phone_verified", 0))),
+            "email_verified": int(bool(r.get("email_verified", 0))),
+            "company_size": r.get("company_size", ""),
+            "updated_at": r.get("updated_at", ""),
         })
     return out
 
@@ -124,3 +143,47 @@ async def export_prospects_csv(
             f.write(text)
         logger.info(f"Exported {len(rows)} prospects to {out_path}")
     return len(rows), text
+
+
+# ── Outbox export ──
+#
+# Separate from the prospect export on purpose. That one answers "who is on
+# the list"; this one answers "what exactly would be sent to them", which is
+# a different question and a different file. The subject and body are the
+# whole point, so they are exported verbatim from the database rather than
+# re-composed: an export that regenerates is not a record of anything.
+
+OUTBOX_COLUMNS = [
+    "recipient_name", "recipient_email", "company", "department", "title",
+    "category", "subject", "body", "status", "email_type", "created_at",
+    "updated_at", "sent_at", "message_id", "thread_ref", "error",
+]
+
+
+def outbox_rows_to_csv(rows: list[dict]) -> str:
+    """Serialise decorated outbox rows. Newlines inside a body survive:
+    csv quotes them, and every spreadsheet reads them back as one cell."""
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=OUTBOX_COLUMNS,
+                            extrasaction="ignore", lineterminator="\r\n")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({
+            "recipient_name": row.get("recipient_name") or "",
+            "recipient_email": row.get("to_email") or "",
+            "company": row.get("recipient_company") or "",
+            "department": row.get("recipient_department") or "",
+            "title": row.get("recipient_title") or "",
+            "category": row.get("role_label") or "",
+            "subject": row.get("subject") or "",
+            "body": row.get("body") or "",
+            "status": row.get("status") or "",
+            "email_type": row.get("email_type") or "",
+            "created_at": row.get("created_at") or "",
+            "updated_at": row.get("updated_at") or "",
+            "sent_at": row.get("sent_at") or "",
+            "message_id": row.get("message_id") or "",
+            "thread_ref": row.get("thread_ref") or "",
+            "error": row.get("error") or "",
+        })
+    return buf.getvalue()

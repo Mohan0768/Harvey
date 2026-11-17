@@ -27,10 +27,13 @@ BANNED_PHRASES = (
 )
 
 # Em and en dashes are the most recognisable AI tell in cold email.
+# Both characters, not the em dash twice: this tuple listed U+2014 in
+# both slots, so every en dash a model produced sailed through a check
+# whose own comment said it was caught.
 # prompts/writer.md bans them in its very first rule, but a prompt rule
 # with no code check is a suggestion: this is the file that turns it
 # into a guarantee.
-AI_DASHES = ("—", "—")
+AI_DASHES = ("—", "–")
 
 MAX_SUBJECT_LEN = 90
 MAX_BODY_WORDS = 220        # hard ceiling; sequences aim far lower

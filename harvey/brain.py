@@ -9,6 +9,7 @@ other one.
 
 import asyncio
 import json
+import os
 import logging
 import re
 import time
@@ -39,7 +40,21 @@ _NON_RETRYABLE_PATTERNS = (
 )
 
 
-PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex"}
+PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex",
+                   "google_cloud": "Claude on Google Cloud",
+                   "anthropic": "Claude API"}
+
+# The Messages API default for this provider, overridden by brain.model
+# in the config when that is set.
+GOOGLE_CLOUD_MODEL = "claude-opus-5-5"
+ANTHROPIC_MODEL = "claude-opus-5-5"
+# Both SDK providers speak the same Messages API; only the client
+# and its credentials differ.
+SDK_PROVIDERS = ("google_cloud", "anthropic")
+# Generous on purpose: output is billed per token actually produced, so
+# a high ceiling costs nothing, while a low one truncates a draft
+# mid-sentence and wastes the whole call.
+GOOGLE_CLOUD_MAX_TOKENS = 16000
 
 # Settings key holding the brain's last health transition, for `harvey
 # status` and the dashboard: {"provider", "status": "ok"|"paused", "reason",
@@ -72,6 +87,60 @@ def active_brain_status(raw: str, provider: str) -> dict:
     now), else {}: a pause recorded for Codex says nothing about Claude."""
     status = parse_brain_status(raw)
     return status if status.get("provider") == provider else {}
+
+
+
+# Whether Application Default Credentials resolved, checked once per process.
+# google.auth.default() reads disk and can reach the metadata server, so it
+# is not something to repeat on every draft.
+_google_credentials_error: str | None = None
+_google_credentials_checked = False
+
+
+def _google_credentials_problem() -> str:
+    """"" when Google credentials are usable, else what to do about it.
+
+    Asking google.auth directly is the only honest check. A service account
+    key file, a gcloud login and the metadata server on a GCP host are all
+    valid, and guessing from environment variables alone would wrongly block
+    the last of those.
+    """
+    global _google_credentials_error, _google_credentials_checked
+    if _google_credentials_checked:
+        return _google_credentials_error or ""
+    _google_credentials_checked = True
+    try:
+        import google.auth
+    except ImportError:
+        _google_credentials_error = ""
+        return ""
+    try:
+        google.auth.default()
+        _google_credentials_error = ""
+    except Exception as exc:
+        name = exc.__class__.__name__
+        if "DefaultCredentials" in name or "default credentials" in str(exc).lower():
+            _google_credentials_error = (
+                "No Google credentials found. Either set "
+                "GOOGLE_APPLICATION_CREDENTIALS to a service account key "
+                "file with roles/claude.user, or run "
+                "'gcloud auth application-default login'.")
+        else:
+            # Something else entirely; let the real call surface it.
+            _google_credentials_error = ""
+    return _google_credentials_error or ""
+
+
+def reset_google_credentials_cache() -> None:
+    """Forget the memoized credential check.
+
+    The check is memoized because it reads disk, but that makes it wrong the
+    moment someone points GOOGLE_APPLICATION_CREDENTIALS at a key file: the
+    process would keep reporting no credentials until it restarted.
+    """
+    global _google_credentials_error, _google_credentials_checked
+    _google_credentials_error = None
+    _google_credentials_checked = False
 
 
 class BrainUnavailable(Exception):
@@ -243,6 +312,12 @@ class Brain:
                 max_retries=max_retries, agent=agent, task=task,
             )
 
+        if self.provider in SDK_PROVIDERS:
+            return await self._think_sdk(
+                prompt, timeout=timeout, max_retries=max_retries,
+                agent=agent, task=task,
+            )
+
         # Windows caps a command line at ~32k chars and surfaces the overflow
         # as FileNotFoundError (WinError 206), so long prompts go via stdin.
         prompt_via_stdin = len(prompt) > _MAX_ARGV_PROMPT_CHARS
@@ -367,6 +442,146 @@ class Brain:
             f"Brain call failed after {max_retries + 1} attempts. "
             f"Last error: {str(last_error)[:200]}"
         )
+        return ""
+
+
+    async def _think_sdk(
+        self,
+        prompt: str,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        agent: str = "",
+        task: str = "",
+    ) -> str:
+        """One Messages API call through the Anthropic SDK.
+
+        Two providers share this path because they differ only in how they
+        prove who you are:
+
+        ``anthropic``     a Claude API key in ANTHROPIC_API_KEY.
+        ``google_cloud``  Claude Models on Google Cloud, Anthropic operated
+                          and reached through a Google Cloud project. There
+                          is no API key there at all: the client takes a
+                          Google access token from Application Default
+                          Credentials.
+
+        Either way the point is the same. The CLI path needs an interactive
+        sign-in, which a dashboard running unattended cannot perform, and
+        which silently turns every generated email into template-only output
+        the moment it lapses.
+        """
+        import asyncio
+
+        if self.provider == "google_cloud":
+            try:
+                from anthropic import AnthropicGoogleCloud as _Client
+            except ImportError as exc:
+                raise BrainUnavailable(
+                    "The Google Cloud client is not installed. Run: "
+                    'pip install -U "anthropic[google_cloud]"'
+                ) from exc
+            # Preflight the two ids. Without them the SDK raises its own
+            # error from inside a retry loop, and the operator is left with
+            # an empty draft and no idea which value is missing.
+            project = (os.environ.get("ANTHROPIC_GOOGLE_CLOUD_PROJECT")
+                       or os.environ.get("GOOGLE_CLOUD_PROJECT"))
+            workspace = os.environ.get("ANTHROPIC_GOOGLE_CLOUD_WORKSPACE_ID")
+            missing = []
+            if not project:
+                missing.append("ANTHROPIC_GOOGLE_CLOUD_PROJECT")
+            if not workspace:
+                missing.append("ANTHROPIC_GOOGLE_CLOUD_WORKSPACE_ID")
+            if missing:
+                raise BrainUnavailable(
+                    "Claude on Google Cloud needs " + " and ".join(missing)
+                    + ". Add them under Settings. The workspace id starts "
+                    "with wrkspc_ and is in the Claude Console under "
+                    "Settings, Workspaces.")
+            credential_problem = _google_credentials_problem()
+            if credential_problem:
+                raise BrainUnavailable(credential_problem)
+            default_model = GOOGLE_CLOUD_MODEL
+        else:
+            try:
+                from anthropic import Anthropic as _Client
+            except ImportError as exc:
+                raise BrainUnavailable(
+                    "The Anthropic SDK is not installed. Run: "
+                    "pip install -U anthropic"
+                ) from exc
+            if not os.environ.get("ANTHROPIC_API_KEY"):
+                raise BrainUnavailable(
+                    "No ANTHROPIC_API_KEY is set. Add it under Settings, or "
+                    "switch brain.provider to google_cloud, which uses your "
+                    "Google credentials instead of a key."
+                )
+            default_model = ANTHROPIC_MODEL
+
+        model = self.config.model or default_model
+        last_error = ""
+
+        for attempt in range(max_retries + 1):
+            try:
+                # max_retries=0: this loop owns retrying, so the SDK must not
+                # retry again inside a call we are already timing.
+                client = _Client(timeout=timeout, max_retries=0)
+                response = await asyncio.to_thread(
+                    client.messages.create,
+                    model=model,
+                    max_tokens=GOOGLE_CLOUD_MAX_TOKENS,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+            except BrainUnavailable:
+                raise
+            except Exception as exc:
+                last_error = str(exc)[:300]
+                # Configuration and permission problems do not improve on a
+                # retry, and the operator needs to see the reason rather than
+                # a generic empty result three attempts later.
+                lowered = last_error.lower()
+                if any(word in lowered for word in (
+                        "workspace", "project", "credential", "permission",
+                        "roles/claude", "not found", "unauthor", "403", "401")):
+                    logger.error("%s refused the call: %s",
+                                 self.provider_label, last_error)
+                    self.unavailable = last_error
+                    await self._record_status("paused", last_error)
+                    return ""
+                logger.warning(
+                    "%s attempt %d/%d failed: %s", self.provider_label,
+                    attempt + 1, max_retries + 1, last_error)
+                if attempt < max_retries:
+                    await asyncio.sleep(2 ** attempt)
+                continue
+
+            text = "".join(
+                block.text for block in response.content
+                if getattr(block, "type", "") == "text"
+            ).strip()
+
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                try:
+                    await self.state.increment_usage()
+                    await self.state.record_usage_event(
+                        agent=agent, task=task, model=model,
+                        input_tokens=getattr(usage, "input_tokens", 0) or 0,
+                        output_tokens=getattr(usage, "output_tokens", 0) or 0,
+                        cache_read_tokens=getattr(
+                            usage, "cache_read_input_tokens", 0) or 0,
+                        cache_creation_tokens=getattr(
+                            usage, "cache_creation_input_tokens", 0) or 0,
+                    )
+                except Exception:
+                    # Accounting must never cost us a draft we already have.
+                    logger.debug("usage recording failed", exc_info=True)
+
+            if text and self.unavailable:
+                self.unavailable = ""
+                await self._record_status("ok", "")
+            return text
+
+        logger.error("%s failed: %s", self.provider_label, last_error)
         return ""
 
     async def _think_codex(

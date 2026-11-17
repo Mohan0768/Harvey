@@ -32,6 +32,11 @@ ERROR_BACKOFF_CAP = 900
 # knowing it's dead — found in production after exactly that happened.
 CYCLE_TIMEOUT_SECONDS = 600
 
+# Below this many untouched prospects, go and find more before writing to
+# the ones already in hand. Keeping the number named makes it tunable and
+# keeps the comparison in decide_action honest about what it means.
+MIN_PIPELINE_PROSPECTS = 20
+
 # Cap on a single quiet-hours sleep chunk. See the quiet-hours block in
 # heartbeat() for why this exists — a system sleep/wake cycle during one
 # multi-hour asyncio.wait_for left Harvey silently stalled well past when
@@ -98,10 +103,16 @@ async def decide_next_action(
         action, reason = "handle_replies", f"{open_conversations} open conversation(s) waiting"
     elif draft_campaigns > 0:
         action, reason = "send_campaign", f"{draft_campaigns} draft campaign(s) ready to deploy"
+    elif new_prospects < MIN_PIPELINE_PROSPECTS:
+        # Top the pipeline up BEFORE writing. This test used to sit after
+        # "new_prospects > 0", which made it unreachable for any value
+        # except exactly zero: one new prospect was enough to stop Harvey
+        # ever prospecting again, whatever the threshold said.
+        action, reason = (
+            "prospect",
+            f"only {new_prospects} new prospect(s); pipeline needs leads")
     elif new_prospects > 0:
         action, reason = "write_campaign", f"{new_prospects} new prospect(s) with no drafts ready"
-    elif new_prospects < 20:
-        action, reason = "prospect", f"only {new_prospects} new prospect(s); pipeline needs leads"
     else:
         action, reason = "idle", "pipeline is healthy; running analysis"
 

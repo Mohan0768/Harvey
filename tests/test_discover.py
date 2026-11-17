@@ -470,7 +470,14 @@ def test_provider_menu_explains_cost_and_configuration():
     assert menu["dataforseo_listings"]["env_keys"] == [
         "DATAFORSEO_LOGIN", "DATAFORSEO_PASSWORD"]
     for entry in menu.values():
-        assert entry["blurb"] and entry["cost_note"] and entry["signup_url"]
+        assert entry["blurb"] and entry["cost_note"]
+        # A signup URL is only meaningful for a provider you have to
+        # sign up for. A keyless one inventing a link would be a lie
+        # about what it costs you to start.
+        if entry["needs_key"]:
+            assert entry["signup_url"]
+        else:
+            assert entry["signup_url"] == "" or entry["signup_url"]
 
 
 def test_the_default_provider_needs_no_account():

@@ -41,6 +41,24 @@ TOKEN_URL = "https://oauth2.googleapis.com/token"
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 LOOPBACK_PORT = 8765
+# How long the loopback listener waits for Google to come back. Named so a
+# test can shorten it; five minutes is the real budget for a human who has
+# to pick an account and read a consent screen.
+CALLBACK_TIMEOUT = 300
+# Two different hosts on purpose.
+#
+# REDIRECT is the string Google compares, character for character, against
+# the client's registered list. "localhost" and "127.0.0.1" are different
+# strings to Google even though they are the same machine, so this has to
+# be whichever one was registered — changing it to the literal IP was
+# enough on its own to produce redirect_uri_mismatch on a client that had
+# been set up correctly.
+#
+# BIND is where the listener actually sits. Staying on the IPv4 address
+# avoids the case where "localhost" resolves to ::1 and the server is not
+# there; browsers fall back to 127.0.0.1 after a refused connection.
+LOOPBACK_REDIRECT_HOST = "localhost"
+LOOPBACK_BIND_HOST = "127.0.0.1"
 
 TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
 
@@ -333,21 +351,36 @@ def exchange_code(client_id: str, client_secret: str, code: str,
     return True, "Gmail authorized."
 
 
-def run_auth_flow(client_id: str, client_secret: str) -> bool:
+def run_auth_flow(client_id: str, client_secret: str, on_url=None,
+                  on_message=None) -> bool:
     """One-time OAuth (installed-app loopback). Blocks until the browser
-    round-trip completes; stores the refresh token for GmailProvider."""
+    round-trip completes; stores the refresh token for GmailProvider.
+
+    ``on_message`` receives the reason for a failure, so a caller with a
+    screen can show what actually went wrong. Without it every failure
+    looks the same from outside, which is how a state mismatch spent days
+    being mistaken for a missing refresh token.
+    """
+    def report(text: str):
+        if on_message is not None:
+            try:
+                on_message(text)
+            except Exception:
+                pass
     import http.server
     import secrets
+    import socket
     import threading
     import urllib.parse
 
     if not client_id or not client_secret:
+        report("Set the client ID and secret in .env first.")
         print("  Set GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET in .env first.")
         print("  (Google Cloud Console → APIs → Credentials → OAuth client, Desktop app)")
         return False
 
     state = secrets.token_urlsafe(16)
-    redirect_uri = f"http://localhost:{LOOPBACK_PORT}"
+    redirect_uri = f"http://{LOOPBACK_REDIRECT_HOST}:{LOOPBACK_PORT}"
     auth_url = build_auth_url(client_id, redirect_uri, state)
 
     result: dict = {}
@@ -356,7 +389,15 @@ def run_auth_flow(client_id: str, client_secret: str) -> bool:
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            # Logged the moment anything arrives. Without this a
+            # failed round-trip is indistinguishable from a browser
+            # that never knocked, and those need opposite fixes.
+            logger.info(
+                "Gmail callback hit: code=%s error=%s state_ok=%s",
+                bool(query.get("code")), query.get("error", ["none"])[0],
+                query.get("state", [""])[0] == state)
             if query.get("state", [""])[0] != state:
+                logger.warning("Gmail callback rejected: state mismatch")
                 self.send_response(400); self.end_headers()
                 return
             result["code"] = query.get("code", [""])[0]
@@ -364,33 +405,96 @@ def run_auth_flow(client_id: str, client_secret: str) -> bool:
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
+            # Deliberately does NOT say "connected": the token
+            # exchange has not run yet and can still fail. Claiming
+            # success here sends people back saying it worked while
+            # Harvey is still waiting.
             self.wfile.write(
-                b"<h2>Harvey is connected to Gmail.</h2>You can close this tab.")
+                b"<h2>Code received.</h2>Go back to Harvey to see "
+                b"whether the connection completed.")
             done.set()
 
         def log_message(self, *args):
             pass
 
-    server = http.server.HTTPServer(("localhost", LOOPBACK_PORT), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    # Listen on BOTH loopback addresses, because the redirect says
+    # "localhost" and that is not one address. Windows resolves it to ::1
+    # before 127.0.0.1, so a server on IPv4 alone can simply not be there
+    # when the browser arrives: Google completes, the consent screen looks
+    # fine, and the code never comes home. Two loopback-only listeners
+    # share one handler, and whichever the browser reaches wins. Binding
+    # "::" instead would cover both with one socket, but that is every
+    # interface, not just this machine.
+    class _Server(http.server.HTTPServer):
+        # Windows allows a second socket to bind a port that is already in
+        # use when SO_REUSEADDR is set, and then hands each connection to
+        # whichever server bound first. A stale listener left over from an
+        # abandoned attempt would therefore swallow the callback and reject
+        # it for carrying a state it has never seen, which looks exactly
+        # like Google never redirecting at all. Refusing to reuse the
+        # address turns that silent failure into an immediate, legible one.
+        allow_reuse_address = False
 
+    class _V6Server(_Server):
+        address_family = socket.AF_INET6
+
+    servers = []
+    for family_server, host in ((_Server, "127.0.0.1"),
+                                (_V6Server, "::1")):
+        try:
+            servers.append(family_server((host, LOOPBACK_PORT), Handler))
+        except OSError as exc:
+            # A machine with IPv6 disabled is fine; one listener is enough.
+            logger.debug("Gmail callback could not bind %s: %s", host, exc)
+    if not servers:
+        report("Could not listen on port " + str(LOOPBACK_PORT)
+               + ". Something else is holding it.")
+        print(f"  Could not listen on port {LOOPBACK_PORT}. Is it in use?")
+        return False
+
+    for server in servers:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    # Hand the URL out before opening anything. webbrowser.open uses the
+    # system default, which may not be the browser you are signed into
+    # Google with, and a consent link you cannot see is a dead end.
+    if on_url is not None:
+        try:
+            on_url(auth_url)
+        except Exception:
+            pass
+    logger.info("Gmail consent URL: %s", auth_url)
     print(f"\n  Opening browser for Google sign-in...\n  {auth_url}\n")
     webbrowser.open(auth_url)
-    if not done.wait(timeout=300):
-        server.shutdown()
-        print("  Timed out waiting for the browser round-trip.")
-        return False
-    server.shutdown()
+    try:
+        if not done.wait(timeout=CALLBACK_TIMEOUT):
+            report("Timed out after " + str(int(CALLBACK_TIMEOUT))
+                   + "s waiting for Google to redirect back.")
+            print("  Timed out waiting for the browser round-trip.")
+            return False
+    finally:
+        # shutdown() only stops serve_forever; the listening socket stays
+        # bound until server_close(). A port still held after the flow ends
+        # is what made every RETRY fail: the next attempt bound the same
+        # port, the stale listener kept winning the callback, and the new
+        # flow waited five minutes for a redirect it had already lost.
+        for server in servers:
+            try:
+                server.shutdown()
+            finally:
+                server.server_close()
 
     if result.get("error") or not result.get("code"):
+        report("Google returned " + str(result.get("error")
+                                       or "no authorization code") + ".")
         print(f"  Authorization failed: {result.get('error') or 'no code returned'}")
         return False
 
     ok, message = exchange_code(
         client_id, client_secret, result["code"], redirect_uri)
     if not ok:
+        report(message)
         print(f"  {message}")
         return False
-    print(f"  ✓ Gmail authorized. Token stored at {TOKEN_FILE}")
+    print(f"  Gmail authorized. Token stored at {TOKEN_FILE}")
     return True

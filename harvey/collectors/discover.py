@@ -208,6 +208,7 @@ class DiscoveryQuery:
     coordinate: str = ""             # "lat,lng,radius_km" for listings providers
     depth: int = 30                  # SERP depth; ignored by listings providers
     limit: int = 100                 # max records to take from one query
+    page: int = 1                    # SERP page; 2+ walks past what page 1 gave
 
     def keyword(self) -> str:
         return f"{self.term} {self.location}".strip()
@@ -428,7 +429,11 @@ class Serper(DiscoveryProvider):
             "https://google.serper.dev/search",
             headers={"X-API-KEY": env["serper_api_key"],
                      "Content-Type": "application/json"},
-            json={"q": query.keyword(), "num": min(query.depth, 100)},
+            json={"q": query.keyword(), "num": min(query.depth, 100),
+                  # Page 2+ is how a repeat run finds something new. Without
+                  # it, the same terms and places return the same first page
+                  # for ever and every result dedupes away as already known.
+                  "page": max(1, query.page)},
         )
         r.raise_for_status()
         data = r.json()
@@ -588,8 +593,145 @@ class OpenStreetMap(DiscoveryProvider):
         return out
 
 
+class FreeWebProvider(DiscoveryProvider):
+    """Search the public web with no key, no account and no bill.
+
+    Reads the HTML search pages DuckDuckGo and Bing serve to any browser,
+    which is the same ground Scout already stands on. It is less precise
+    than a paid SERP API and it will be rate limited if hammered, so it
+    paces itself and falls through from one engine to the next rather than
+    retrying one hard.
+
+    Deliberately NOT a trial tier of something paid: there is no signup,
+    nothing expires, and estimate() is honestly zero rather than a number
+    that becomes real later.
+    """
+
+    key = "free_web"
+    label = "Free web search (DuckDuckGo, Bing)"
+    kind = "serp"
+    blurb = ("Searches the public web with no API key at all. Start here: it "
+             "costs nothing and needs no account.")
+    caveat = ("Public HTML endpoints, so results are shallower than a paid "
+              "SERP API and heavy use gets throttled. One query at a time, "
+              "with a pause between.")
+    cost_note = "free"
+    free_tier = "unlimited, within polite rate limits"
+    needs_key = False
+    signup_url = ""
+    env_keys = ()
+
+    HEADERS = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/124.0 Safari/537.36"),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    def estimate(self, queries):
+        return 0.0
+
+    async def fetch(self, client, env, query):
+        import asyncio
+        import random
+
+        keyword = query.keyword()
+        # One engine at a time, first non-empty answer wins. Pausing even
+        # on the first keeps a burst of queries from reading as a bot.
+        await asyncio.sleep(random.uniform(1.0, 2.5))
+        for engine in (self._duckduckgo, self._bing):
+            try:
+                hits = await engine(client, keyword)
+            except Exception as exc:
+                logger.debug("free_web %s failed: %s", engine.__name__, exc)
+                hits = []
+            if hits:
+                return self._to_businesses(hits, query)
+        return []
+
+    async def _duckduckgo(self, client, keyword):
+        from urllib.parse import parse_qs, quote_plus, urlparse
+
+        r = await client.get(
+            "https://html.duckduckgo.com/html/?q=" + quote_plus(keyword),
+            headers=self.HEADERS, follow_redirects=True)
+        r.raise_for_status()
+        soup = _soup(r.text)
+        if soup is None:
+            return []
+        out = []
+        for block in soup.select(".result"):
+            link = block.select_one(".result__a")
+            if not (link and link.get("href")):
+                continue
+            href = str(link.get("href"))
+            # DuckDuckGo wraps every link in its own redirect.
+            if "uddg=" in href:
+                real = parse_qs(urlparse(href).query).get("uddg") or []
+                if real:
+                    href = real[0]
+            if href.startswith("http"):
+                out.append((link.get_text(strip=True), href))
+        return out
+
+    async def _bing(self, client, keyword):
+        from urllib.parse import quote_plus
+
+        r = await client.get(
+            "https://www.bing.com/search?q=" + quote_plus(keyword) + "&count=30",
+            headers=self.HEADERS, follow_redirects=True)
+        r.raise_for_status()
+        soup = _soup(r.text)
+        if soup is None:
+            return []
+        out = []
+        for item in soup.select("li.b_algo"):
+            link = item.select_one("h2 a")
+            if not (link and link.get("href")):
+                continue
+            href = str(link.get("href"))
+            if href.startswith("http"):
+                out.append((link.get_text(strip=True), href))
+        return out
+
+    def _to_businesses(self, hits, query):
+        out, seen = [], set()
+        for rank, (title, href) in enumerate(hits, start=1):
+            domain = normalize_domain(href)
+            if not domain or domain in seen:
+                continue
+            seen.add(domain)
+            out.append(Business(
+                name=title or domain,
+                domain=domain,
+                website=href,
+                location=query.location,
+                rank=rank,
+                has_website=True,
+                source_url=href,
+            ))
+            if len(out) >= query.limit:
+                break
+        return out
+
+
+def _soup(html: str):
+    """BeautifulSoup over a search page, or None when it cannot be parsed."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        logger.warning("free_web needs beautifulsoup4; pip install -e .")
+        return None
+    try:
+        return BeautifulSoup(html, "html.parser")
+    except Exception as exc:
+        logger.debug("free_web could not parse a search page: %s", exc)
+        return None
+
+
 PROVIDERS: dict[str, DiscoveryProvider] = {
     p.key: p for p in (
+        FreeWebProvider(),
         OpenStreetMap(),
         DataForSEOListings(),
         DataForSEOSerp(),
@@ -597,7 +739,11 @@ PROVIDERS: dict[str, DiscoveryProvider] = {
     )
 }
 
-DEFAULT_PROVIDER = "osm"
+# Free web search, not OpenStreetMap. OSM maps premises by trade and has no
+# category for a university, a business school or a career centre, so for
+# anything that is not one of its nine mapped trades it returns nothing at
+# all — which reads as "discovery is broken" rather than "wrong source".
+DEFAULT_PROVIDER = "free_web"
 
 
 def _dfs_items(payload: dict) -> list[dict]:
@@ -658,9 +804,81 @@ class DiscoveryReport:
         }
 
 
+# Categories a person is likely to mean, in the words a search engine
+# answers best. A typed category is matched against these before it is sent
+# anywhere: "universithy" finding nothing is a worse answer than searching
+# for universities.
+CANONICAL_CATEGORIES = (
+    "universities",
+    "colleges and universities",
+    "community colleges",
+    "state colleges",
+    "technical colleges",
+    "technical institutions",
+    "business schools",
+    "career centers",
+    "career services",
+    "engineering colleges",
+    "arts and science colleges",
+)
+
+# Spellings and shorthands worth mapping outright, where a close match
+# would be ambiguous or would not fire at all.
+CATEGORY_ALIASES = {
+    "university": "universities",
+    "college": "colleges and universities",
+    "colleges": "colleges and universities",
+    "institutes": "technical institutions",
+    "institutions": "colleges and universities",
+    "uni": "universities",
+    "unis": "universities",
+    "cc": "community colleges",
+    "b school": "business schools",
+    "bschool": "business schools",
+    "mba colleges": "business schools",
+    "career centre": "career centers",
+    "career centres": "career centers",
+    "placement cell": "career services",
+    "placement cells": "career services",
+    "hr department": "universities",
+    "hr departments": "universities",
+    "marketing department": "universities",
+    "marketing departments": "universities",
+}
+
+
+def normalise_category(term: str) -> str:
+    """Map a typed category onto something a search engine answers well.
+
+    Returns the term unchanged when it is already sensible or when nothing
+    close is found: a guess that silently rewrites an intentional term is
+    worse than passing it through.
+    """
+    import difflib
+
+    raw = " ".join((term or "").split()).strip().lower()
+    if not raw:
+        return ""
+    if raw in CATEGORY_ALIASES:
+        return CATEGORY_ALIASES[raw]
+    if raw in CANONICAL_CATEGORIES:
+        return raw
+    # Departments are not institutions; search for the institution and let
+    # the per-site crawl find the department's people.
+    close = difflib.get_close_matches(raw, CANONICAL_CATEGORIES, n=1, cutoff=0.72)
+    if close:
+        return close[0]
+    singular = difflib.get_close_matches(
+        raw, list(CATEGORY_ALIASES), n=1, cutoff=0.78)
+    if singular:
+        return CATEGORY_ALIASES[singular[0]]
+    return raw
+
+
 def build_queries(config, cities: list[str] | None = None,
                   depth: int = 30, limit: int = 100,
-                  terms: list[str] | None = None) -> list[DiscoveryQuery]:
+                  terms: list[str] | None = None,
+                  page: int = 1) -> list[DiscoveryQuery]:
     """Turn an ICP into a concrete query list.
 
     One query per (term x place). Both axes may be overridden per run:
@@ -674,12 +892,14 @@ def build_queries(config, cities: list[str] | None = None,
     icp = config.icp
     terms = ([t.strip() for t in terms if t and t.strip()] if terms else None) \
         or list(icp.industries) or [config.product.name]
+    # Typed terms get spelling help; the configured ICP is left as written.
+    terms = [normalise_category(t) for t in terms]
     places = cities if cities is not None else list(icp.geography) or [""]
     coords = getattr(icp, "geo_coordinates", {}) or {}
 
     return [
         DiscoveryQuery(term=term, location=place, depth=depth, limit=limit,
-                       coordinate=coords.get(place, ""))
+                       page=max(1, page), coordinate=coords.get(place, ""))
         for term in terms
         for place in places
     ]

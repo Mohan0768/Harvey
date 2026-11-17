@@ -235,7 +235,7 @@ class UsageConfig(BaseModel):
         return v
 
 
-BRAIN_PROVIDERS = ("claude", "codex")
+BRAIN_PROVIDERS = ("claude", "codex", "google_cloud", "anthropic")
 CODEX_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 # Model names are passed to a CLI, so they must look like a model name and
@@ -247,7 +247,11 @@ class BrainConfig(BaseModel):
     """Which subscription Harvey thinks with.
 
     ``claude`` (default) runs Claude Code headless on your Claude plan.
-    ``codex`` runs Codex on your ChatGPT plan. There is never an automatic
+    ``codex`` runs Codex on your ChatGPT plan. ``google_cloud`` calls the
+    Messages API directly through Claude Models on Google Cloud
+    (Anthropic managed), which authenticates with Google credentials
+    rather than an interactive sign-in, so it is the one option a
+    server can use unattended. There is never an automatic
     fallback between them, and an explicit ``model`` only affects Harvey —
     your own Claude Code / Codex settings are never read or changed.
     """
@@ -287,6 +291,23 @@ class BrainConfig(BaseModel):
         return v
 
 
+class OutreachConfig(BaseModel):
+    """Facts the beta invitation is allowed to state about who is writing.
+
+    Every field here ends up verbatim in mail to real academics, so each one
+    is left empty until a human fills it in. harvey/outreach.py omits the
+    sentence that needs a missing field rather than inventing a stand-in:
+    an email that says less is recoverable, an email that invents a founder
+    biography is not.
+    """
+
+    organization: str = ""     # the entity doing the inviting
+    founder_name: str = ""     # who built it, if that is said at all
+    founder_bio: str = ""      # ONE verified sentence, or leave empty
+    demo_url: str = ""         # the only URL any invitation may contain
+    reply_to: str = ""         # where a reply should land
+
+
 class HarveyConfig(BaseModel):
     persona: PersonaConfig
     product: ProductConfig
@@ -295,6 +316,7 @@ class HarveyConfig(BaseModel):
     usage: UsageConfig = UsageConfig()
     brain: BrainConfig = BrainConfig()
     compliance: ComplianceConfig = ComplianceConfig()
+    outreach: OutreachConfig = OutreachConfig()
 
 
 class EnvConfig(BaseModel):

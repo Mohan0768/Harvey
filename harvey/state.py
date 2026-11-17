@@ -1047,6 +1047,24 @@ class StateManager:
                 row = await c.fetchone()
         return await self.get_conversation(row["conversation_id"]) if row else None
 
+    async def delete_outbox_item(self, item_id: str) -> bool:
+        """Remove a draft outright. Refuses anything that has left the building.
+
+        Rejecting keeps a record of a decision; deleting removes the row. That
+        is fine for something that was never sent and wrong for something that
+        was, so a sent or in-flight item is never deletable: the outbox is the
+        only record that an email exists, and an audit trail you can quietly
+        erase is not one.
+        """
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "DELETE FROM outbox WHERE id = ? "
+                "AND status NOT IN ('sent', 'sending')",
+                (item_id,),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
     async def cancel_pending_review_for_prospect(
         self, prospect_id: str, reason: str = "replaced",
         except_id: str = "",

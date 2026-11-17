@@ -17,3 +17,6 @@ uvicorn>=0.34,<1
 openpyxl>=3.1,<4
 xlrd>=2.0,<3
 python-multipart>=0.0.9,<1
+# The container has no interactive Claude CLI to sign in to, so a deployed
+# Harvey can only think through a key-based provider. Not optional here.
+anthropic>=0.40,<3

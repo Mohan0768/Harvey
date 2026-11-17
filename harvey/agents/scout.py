@@ -570,7 +570,7 @@ class Scout:
 
     # ── Strategy 0: Known companies with zero prospects ──
 
-    async def _prospect_via_known_companies(self) -> int:
+    async def _prospect_via_known_companies(self, limit: int | None = None) -> int:
         """Scrape team pages for companies already on file with no contacts.
 
         Company-only sources (`harvey discover`, directory scraping, etc.)
@@ -585,8 +585,11 @@ class Scout:
         )
 
         try:
+            # The per-cycle cap paces an unattended heartbeat. An on-demand
+            # run is someone sitting and waiting for it, so it may ask for
+            # a bigger batch.
             companies = await self.state.companies_needing_prospects(
-                limit=MAX_COMPANIES_PER_CYCLE
+                limit=limit or MAX_COMPANIES_PER_CYCLE
             )
         except Exception as e:
             logger.debug(f"companies_needing_prospects failed: {e}")

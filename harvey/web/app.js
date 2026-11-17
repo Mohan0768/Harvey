@@ -2,6 +2,7 @@ let currentTab = 'today';
 let companyDrill = false;      // true while viewing a single company's contacts
 let _companies = [], _prospects = [], _campaigns = [];
 let _gmailSecretSaved = false;
+let _serperSaved = false;
 let _signals = null;           // last /api/signals payload, for the cohort builder
 let _desk = { items: [], i: 0, editing: null };
 
@@ -675,6 +676,26 @@ async function loadSettings() {
   const data = await api('/api/settings');
   if (!data) return;
 
+  // Where Harvey thinks. Populated before the export-only early return
+  // below, because thinking is needed whether or not Harvey also sends.
+  const setVal = (id, v) => {
+    const el = document.getElementById(id);
+    if (el) el.value = v || '';
+  };
+  const brainSel = document.getElementById('brain-provider');
+  if (brainSel && data.brain_provider) brainSel.value = data.brain_provider;
+  const keyEl = document.getElementById('brain-api-key');
+  if (keyEl) {
+    keyEl.value = '';
+    keyEl.placeholder = data.anthropic_api_key_set
+      ? 'Saved - enter a new key to change' : 'sk-ant-...';
+  }
+  brainProviderChanged();
+  setVal('gc-project', data.gc_project);
+  setVal('gc-workspace', data.gc_workspace);
+  setVal('gc-credentials', data.gc_credentials);
+  loadBrainState();
+
   // Active provider indicator
   const prov = data.provider || 'instantly';
   const provEl = document.getElementById('active-provider');
@@ -723,6 +744,16 @@ async function loadSettings() {
     else { g.className = 'email-tag guess'; g.textContent = 'not set up'; }
   }
 
+  _serperSaved = !!data.serper_api_key_set;
+  savedPh('serper-key', data.serper_api_key_set, '2,500 searches free, no card');
+  const dks = document.getElementById('discovery-keys-state');
+  if (dks) {
+    dks.innerHTML = data.serper_api_key_set
+      ? '<div class="test-result success">Serper key saved. Discovery can search Google.</div>'
+      : '<div class="test-result error">No search key. Discovery falls back to ' +
+        'OpenStreetMap, which cannot find universities and will return nothing.</div>';
+  }
+
   if (!sending) return;
 
   // Non-secret values repopulate
@@ -764,10 +795,99 @@ function saveSmtp() {
   saveEnv(payload, 'SMTP settings saved.').then(loadSettings);
 }
 
+function saveDiscoveryKeys() {
+  const el = document.getElementById('serper-key');
+  const key = ((el && el.value) || '').trim();
+  // Refuse an empty save rather than posting "" over a stored key, which is
+  // how a credential gets quietly wiped by a hopeful click.
+  if (!key) {
+    showToast(_serperSaved
+      ? 'The key is already saved. Paste a new one to replace it.'
+      : 'Paste your Serper key first.', 'error');
+    return;
+  }
+  saveEnv({SERPER_API_KEY: key}, 'Discovery key saved.')
+    .then(loadSettings)
+    .then(() => { if (typeof loadDiscoverProviders === 'function') loadDiscoverProviders(); });
+}
+
 function saveVerifiers() {
   const r = document.getElementById('reoon-key').value;
   if (!r) { showToast('Enter a Reoon key first.', 'error'); return; }
   saveEnv({REOON_API_KEY: r}, 'Verification key saved.').then(loadSettings);
+}
+
+// Only the fields the chosen provider actually uses. Showing a Google
+// Cloud project box to someone pasting an API key invites them to fill in
+// settings that will never be read.
+function brainProviderChanged() {
+  const how = ((document.getElementById('brain-provider') || {}).value) || '';
+  const show = (id, on) => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = on ? '' : 'none';
+  };
+  show('brain-key-row', how === 'anthropic');
+  show('brain-gc-rows', how === 'google_cloud');
+}
+
+async function saveBrainAccess() {
+  const v = id => ((document.getElementById(id) || {}).value || '').trim();
+  const how = v('brain-provider') || 'anthropic';
+  const payload = {};
+
+  if (how === 'anthropic') {
+    const key = v('brain-api-key');
+    // Blank means "leave what is stored alone", so a saved key survives a
+    // save made to change something else.
+    if (key) payload.ANTHROPIC_API_KEY = key;
+  } else if (how === 'google_cloud') {
+    if (!v('gc-project') || !v('gc-workspace')) {
+      showToast('The project and workspace ids are both required.', 'error');
+      return;
+    }
+    payload.ANTHROPIC_GOOGLE_CLOUD_PROJECT = v('gc-project');
+    payload.ANTHROPIC_GOOGLE_CLOUD_WORKSPACE_ID = v('gc-workspace');
+    payload.GOOGLE_APPLICATION_CREDENTIALS = v('gc-credentials');
+  }
+
+  if (Object.keys(payload).length) await saveEnv(payload, 'Saved.');
+  const d = await contactApi('/api/brain/provider', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({provider: how})
+  });
+  if (d && d.success) showToast('Saved. Restart Harvey to apply.', 'success');
+  else showToast((d && d.message) || 'Could not save the provider.', 'error');
+  const el = document.getElementById('brain-api-key');
+  if (el) { el.value = ''; el.placeholder = 'Saved - enter a new key to change'; }
+  loadBrainState();
+}
+
+// A real round trip, because every other signal lies. The settings can all
+// look right while the role is missing or the key file points nowhere, and
+// the only way to know is to ask the model something.
+async function testBrain() {
+  const out = document.getElementById('brain-test-result');
+  if (out) out.innerHTML = '<div class="test-result pending">Asking the model...</div>';
+  const d = await contactApi('/api/brain/test', {method: 'POST'});
+  if (!out) return;
+  if (d && d.success) {
+    out.innerHTML = '<div class="test-result success">Connected. ' +
+      escHtml(d.provider || '') + ' answered: ' + escHtml(d.reply || '') + '</div>';
+  } else {
+    out.innerHTML = '<div class="test-result error">' +
+      escHtml((d && d.message) || 'No answer.') + '</div>';
+  }
+  loadBrainState();
+}
+
+async function loadBrainState() {
+  const el = document.getElementById('brain-state');
+  if (!el) return;
+  const d = await api('/api/brain/status');
+  if (!d || !d.success) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div class="test-result ' +
+    (d.ready ? 'success' : 'pending') + '">' +
+    escHtml(d.detail || '') + '</div>';
 }
 
 async function saveEnv(payload, okMsg) {
@@ -1030,6 +1150,53 @@ async function loadUsage() {
 // the approval ladder exists to prevent. One email fills the pane; the rest
 // wait in the rail.
 
+// Outbox view state. The desk reviews one email at a time; this is
+// everything around it: what is being looked at, and what is selected.
+var _ob = {q: '', role: '', status: '', selected: {}};
+
+// Unclassified needs a value of its own. An <option value=""> for it would
+// be a second empty-valued option after "Every category", and the browser
+// would show whichever came last as the selection.
+var OB_NO_ROLE = '__none__';
+
+function obMatch(r) {
+  if (_ob.role === OB_NO_ROLE) { if (r.role) return false; }
+  else if (_ob.role && (r.role || '') !== _ob.role) return false;
+  if (!_ob.q) return true;
+  var hay = [r.recipient_name, r.to_email, r.subject, r.recipient_company,
+             r.role_label].join(' ').toLowerCase();
+  return hay.indexOf(_ob.q) !== -1;
+}
+
+function obSetSearch(v) { _ob.q = (v || '').trim().toLowerCase(); loadOutbox(); }
+function obSetRole(v) { _ob.role = v || ''; loadOutbox(); }
+function obSetStatus(v) { _ob.status = v || ''; loadOutbox(); }
+
+function obToggle(id, on) {
+  if (on) _ob.selected[id] = true; else delete _ob.selected[id];
+  var n = Object.keys(_ob.selected).length;
+  var el = document.getElementById('ob-selcount');
+  if (el) el.textContent = n ? n + ' selected' : '';
+}
+
+function obSelectedIds() { return Object.keys(_ob.selected); }
+
+function obExport(scope) {
+  // Export is a download, so it goes through the browser rather than fetch:
+  // the server already knows how to filter, and the file should land in the
+  // downloads folder like any other.
+  var p = [];
+  if (scope === 'selected') {
+    var ids = obSelectedIds();
+    if (!ids.length) { showToast('Nothing selected.', 'error'); return; }
+    p.push('ids=' + encodeURIComponent(ids.join(',')));
+  } else {
+    if (_ob.role) p.push('role=' + encodeURIComponent(_ob.role));
+    if (_ob.status) p.push('status=' + encodeURIComponent(_ob.status));
+  }
+  window.location = '/api/export/outbox.csv' + (p.length ? '?' + p.join('&') : '');
+}
+
 async function loadOutbox() {
   const data = await api('/api/outbox');
   const banner = document.getElementById('outbox-banner');
@@ -1038,41 +1205,96 @@ async function loadOutbox() {
   const actions = document.getElementById('outbox-actions');
   if (!data) { desk.innerHTML = offlineState(); list.innerHTML = ''; return; }
 
-  const pending = data.pending || [];
+  const all = [].concat(data.drafts || [], data.pending || [],
+                        data.approved || [], data.sending || [],
+                        data.sent || [], data.failed || []);
+  const roleCounts = {};
+  all.forEach(r => {
+    const k = r.role || '';
+    if (!roleCounts[k]) roleCounts[k] = {label: r.role_label || 'Unclassified', n: 0};
+    roleCounts[k].n++;
+  });
+
+  const pending = (data.pending || []).filter(obMatch);
   _desk.items = pending;
   if (_desk.i >= pending.length) _desk.i = Math.max(0, pending.length - 1);
-  navCount('nav-outbox', pending.length);
+  navCount('nav-outbox', (data.pending || []).length);
 
   actions.innerHTML =
+    '<span class="muted" id="ob-selcount" style="font-size:12px;align-self:center"></span>' +
+    '<button class="btn btn-secondary btn-sm" onclick="obExport(\'selected\')">Export selected</button>' +
+    '<button class="btn btn-secondary btn-sm" onclick="obExport(\'filtered\')">Export all</button>' +
+    (pending.length
+      ? '<button class="btn btn-secondary btn-sm" onclick="outboxRegenerateAll()">' +
+        (obNarrowed() ? 'Regenerate ' + pending.length + ' shown'
+                      : 'Regenerate all ' + pending.length) + '</button>' : '') +
+    (pending.length
+      ? '<button class="btn btn-secondary btn-sm" onclick="outboxRejectAll()">' +
+        (obNarrowed() ? 'Reject ' + pending.length + ' shown'
+                      : 'Reject all ' + pending.length) + '</button>' : '') +
     (pending.length && !data.paused
-      ? '<button class="btn btn-primary btn-sm" onclick="outboxApproveAll()">Approve all ' +
-        pending.length + '</button>' : '') +
+      ? '<button class="btn btn-primary btn-sm" onclick="outboxApproveAll()">' +
+        (obNarrowed() ? 'Approve ' + pending.length + ' shown'
+                      : 'Approve all ' + pending.length) + '</button>' : '') +
     (data.paused
       ? '<button class="btn btn-secondary btn-sm" onclick="sendingToggle(\'resume\')">' +
         'Resume sending</button>'
       : '<button class="btn btn-secondary btn-sm" onclick="sendingToggle(\'pause\')">' +
         'Pause all sending</button>');
 
-  // The kill switch gets a banner only when it's actually on — a permanent
-  // bar for a thing that isn't happening is just noise.
-  banner.innerHTML = data.paused
-    ? '<div class="card" style="border-color:var(--red);margin-bottom:16px">' +
-        '<h2 style="color:var(--red)">&#9888; Sending is paused</h2>' +
-        '<p style="color:var(--text-2);font-size:13px">' + escHtml(data.paused) +
-        '. Approved mail stays queued until you resume.</p></div>'
-    : '';
+  // The kill switch gets a banner only when it's actually on.
+  banner.innerHTML =
+    (data.paused
+      ? '<div class="card" style="border-color:var(--red);margin-bottom:16px">' +
+          '<h2 style="color:var(--red)">&#9888; Sending is paused</h2>' +
+          '<p style="color:var(--text-2);font-size:13px">' + escHtml(data.paused) +
+          '. Approved mail stays queued until you resume.</p></div>'
+      : '') +
+    '<div class="card" style="margin-bottom:16px"><div style="display:flex;gap:8px;flex-wrap:wrap">' +
+      '<input class="form-input" id="ob-search" placeholder="Search name, address, subject" ' +
+        'style="flex:1;min-width:200px" value="' + escHtml(_ob.q) +
+        '" oninput="obSetSearch(this.value)">' +
+      '<select class="form-input" style="max-width:220px" onchange="obSetRole(this.value)">' +
+        ['<option value="">Every category</option>'].concat(
+          Object.keys(roleCounts).sort().map(k => {
+            var v = k || OB_NO_ROLE;
+            return '<option value="' + escHtml(v) + '"' +
+              (_ob.role === v ? ' selected' : '') + '>' +
+              escHtml(roleCounts[k].label) + ' (' + roleCounts[k].n + ')</option>';
+          })
+        ).join('') +
+      '</select>' +
+      '<select class="form-input" style="max-width:180px" onchange="obSetStatus(this.value)">' +
+        ['', 'draft', 'pending_review', 'approved', 'sent', 'failed'].map(s =>
+          '<option value="' + s + '"' + (_ob.status === s ? ' selected' : '') + '>' +
+          (s ? escHtml(statusMeta(s).label) : 'Every status') + '</option>').join('') +
+      '</select>' +
+    '</div></div>';
 
   desk.innerHTML = pending.length ? renderDesk(pending, _desk.i) :
-    '<div class="card">' + emptyState('&#10003;', 'Nothing to review',
-      'Every draft Harvey writes lands here first. Approve one and it sends on schedule.') +
+    '<div class="card">' + emptyState('&#10003;',
+      (data.pending || []).length ? 'Nothing matches that filter' : 'Nothing to review',
+      (data.pending || []).length
+        ? 'Clear the search or category filter to see the rest.'
+        : 'Every draft Harvey writes lands here first. Approve one and it sends on schedule.') +
     '</div>';
 
-  const table = (title, rows, cols) => {
-    if (!rows || !rows.length) return '';
-    let h = '<div class="card"><h2>' + title + '</h2><div class="table-card"><table><thead><tr>' +
+  const act = r =>
+    '<button class="btn btn-secondary btn-sm" onclick="previewEmail(\'' + r.id +
+    '\')">Preview</button>';
+  const pick = r =>
+    '<input type="checkbox" onchange="obToggle(\'' + r.id + '\', this.checked)"' +
+    (_ob.selected[r.id] ? ' checked' : '') + '>';
+
+  const table = (title, rows, cols, key) => {
+    rows = (rows || []).filter(obMatch);
+    if (_ob.status && key !== _ob.status) return '';
+    if (!rows.length) return '';
+    let h = '<div class="card"><h2>' + title + ' <span class="muted" style="font-weight:400">(' +
+      rows.length + ')</span></h2><div class="table-card"><table><thead><tr><th></th>' +
       cols.map(c => '<th>' + c[0] + '</th>').join('') + '</tr></thead><tbody>';
     for (const r of rows) {
-      h += '<tr>' + cols.map(c => '<td' + (c[2] ? ' class="muted"' : '') + '>' +
+      h += '<tr><td>' + pick(r) + '</td>' + cols.map(c => '<td' + (c[2] ? ' class="muted"' : '') + '>' +
         (c[3] ? c[1](r) : escHtml(String(c[1](r) ?? ''))) + '</td>').join('') + '</tr>';
     }
     return h + '</tbody></table></div></div>';
@@ -1081,30 +1303,149 @@ async function loadOutbox() {
   list.innerHTML =
     table('Saved drafts', data.drafts, [
       ['To', r => r.recipient_name ? r.recipient_name + ' <' + r.to_email + '>' : r.to_email],
+      ['Category', r => r.role_label || '', true],
       ['Subject', r => r.subject],
       ['Created', r => formatDate(r.created_at), true],
-      ['', r => '<button class="btn btn-secondary btn-sm" onclick="outboxPromote(\'' +
+      ['', r => act(r) + ' <button class="btn btn-secondary btn-sm" onclick="outboxPromote(\'' +
         r.id + '\')">Move to Outbox</button>', false, true],
-    ]) +
+    ], 'draft') +
+    table('Waiting for review', data.pending, [
+      ['To', r => r.recipient_name ? r.recipient_name + ' <' + r.to_email + '>' : r.to_email],
+      ['Category', r => r.role_label || '', true],
+      ['Subject', r => r.subject],
+      ['Created', r => formatDate(r.created_at), true],
+      ['', r => act(r), false, true],
+    ], 'pending_review') +
     table('Approved &amp; scheduled', data.approved, [
-      ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
+      ['To', r => r.to_email], ['Category', r => r.role_label || '', true],
+      ['Subject', r => r.subject],
       ['Sends', r => formatDate(r.send_at), true],
-    ]) +
+      ['', r => act(r), false, true],
+    ], 'approved') +
     table('Sending now', data.sending, [
       ['To', r => r.to_email], ['Subject', r => r.subject],
       ['Started', r => formatDate(r.updated_at), true],
-    ]) +
+    ], 'sending') +
     table('Recently sent', data.sent, [
       ['To', r => r.recipient_name ? r.recipient_name + ' <' + r.to_email + '>' : r.to_email],
       ['Subject', r => r.subject],
       ['Gmail message', r => r.message_id || '-', true],
       ['Thread', r => r.thread_ref || '-', true],
       ['Sent', r => formatDate(r.sent_at), true],
-    ]) +
+      ['', r => act(r), false, true],
+    ], 'sent') +
     table('Didn\'t send', data.failed, [
       ['To', r => r.to_email], ['Status', r => badge(r.status), false, true],
       ['Reason', r => r.error, true], ['Updated', r => formatDate(r.updated_at), true],
-    ]);
+      ['', r => act(r), false, true],
+    ], 'failed');
+
+  if (!list.innerHTML) {
+    list.innerHTML = '<div class="card">' + emptyState('&#128269;', 'No emails match',
+      'Nothing in the Outbox matches that search, category or status.') + '</div>';
+  }
+}
+
+// ── Preview ──
+//
+// Shows the email exactly as stored and composes nothing. A preview that
+// regenerated would show you something other than what you are approving,
+// which defeats the only purpose the screen has.
+async function previewEmail(id) {
+  const root = document.getElementById('modal-root');
+  if (!root) return;
+  root.innerHTML =
+    '<div class="modal-backdrop" onclick="modalBackdropClick(event)">' +
+    '<div class="modal" role="dialog" aria-modal="true" aria-label="Email preview">' +
+    '<h2>Email preview</h2><div id="pv-body">' +
+    '<div class="test-result pending">Loading...</div></div></div></div>';
+  _modalEscHandler = e => { if (e.key === 'Escape') closeModal(); };
+  document.addEventListener('keydown', _modalEscHandler);
+
+  const d = await contactApi('/api/outbox/item/' + encodeURIComponent(id));
+  const body = document.getElementById('pv-body');
+  if (!body) return;
+  if (!d || !d.success) {
+    body.innerHTML = '<div class="modal-error show">' +
+      escHtml((d && d.message) || 'Could not load that email.') + '</div>';
+    return;
+  }
+  renderPreview(d.item);
+}
+
+function renderPreview(it) {
+  const body = document.getElementById('pv-body');
+  if (!body) return;
+  const row = (k, v) => v
+    ? '<tr><td class="muted" style="padding:2px 12px 2px 0;white-space:nowrap">' +
+      k + '</td><td style="padding:2px 0">' + v + '</td></tr>' : '';
+  const editable = ['draft', 'pending_review', 'failed'].indexOf(it.status) !== -1;
+
+  body.innerHTML =
+    '<div class="card" style="margin-bottom:12px"><table style="font-size:13px">' +
+      row('To', escHtml(it.recipient_name || '') +
+          (it.recipient_name ? ' &lt;' + escHtml(it.to_email) + '&gt;' : escHtml(it.to_email))) +
+      row('Organisation', escHtml(it.recipient_company || '')) +
+      row('Title', escHtml(it.recipient_title || '')) +
+      row('Category', escHtml(it.role_label || '')) +
+      row('Type', escHtml(it.email_type || '')) +
+      row('Status', badge(it.status)) +
+      row('Created', escHtml(formatDate(it.created_at))) +
+      row('Sent', escHtml(formatDate(it.sent_at))) +
+      row('Gmail message', escHtml(it.message_id || '')) +
+    '</table></div>' +
+    (it.error ? '<div class="test-result error">Last attempt failed: ' +
+       escHtml(it.error) + '</div>' : '') +
+    '<div class="card">' +
+      '<div class="subject" style="margin-bottom:8px">' +
+        escHtml(it.subject || '(no subject)') + '</div>' +
+      '<div class="body" style="white-space:pre-wrap">' + escHtml(it.body || '') + '</div>' +
+    '</div>' +
+    '<div class="btn-group" style="margin-top:12px">' +
+      (editable
+        ? '<button class="btn btn-secondary" onclick="previewRegenerate(\'' + it.id +
+          '\')">Regenerate</button>' +
+          '<button class="btn btn-secondary" onclick="previewDelete(\'' + it.id +
+          '\')">Delete</button>'
+        : '') +
+      '<button class="btn btn-secondary" onclick="obExportOne(\'' + it.id +
+        '\')">Export</button>' +
+      '<button class="btn btn-secondary" onclick="closeModal()">Close</button>' +
+    '</div>';
+}
+
+function obExportOne(id) {
+  window.location = '/api/export/outbox.csv?ids=' + encodeURIComponent(id);
+}
+
+async function previewRegenerate(id) {
+  const body = document.getElementById('pv-body');
+  if (body) body.innerHTML = '<div class="test-result pending">Writing a fresh version...</div>';
+  const d = await contactApi('/api/outbox/' + encodeURIComponent(id) + '/regenerate',
+                             {method: 'POST'});
+  if (!d || !d.success) {
+    showToast((d && d.message) || 'Could not regenerate.', 'error');
+    previewEmail(id);
+    return;
+  }
+  showToast('Rewritten.', 'success');
+  previewEmail(id);
+  loadOutbox();
+}
+
+async function previewDelete(id) {
+  var go = await askConfirm('Delete this draft? This cannot be undone.',
+                            'Delete');
+  if (!go) return;
+  const d = await contactApi('/api/outbox/' + encodeURIComponent(id), {method: 'DELETE'});
+  if (!d || !d.success) {
+    showToast((d && d.message) || 'Could not delete.', 'error');
+    return;
+  }
+  delete _ob.selected[id];
+  showToast('Deleted.', 'success');
+  closeModal();
+  loadOutbox();
 }
 
 function renderDesk(items, i) {
@@ -1145,7 +1486,9 @@ function renderDesk(items, i) {
               'Approve &amp; send <kbd>A</kbd></button>' +
             '<button class="btn btn-secondary" onclick="outboxAct(\'' + cur.id + '\',\'reject\')">' +
               'Reject <kbd>R</kbd></button>' +
-            '<button class="btn btn-secondary" onclick="deskEdit(\'' + cur.id + '\')">Edit</button>') +
+            '<button class="btn btn-secondary" onclick="deskEdit(\'' + cur.id + '\')">Edit</button>' +
+            '<button class="btn btn-secondary" id="desk-regen" onclick="deskRegenerate(\'' +
+              cur.id + '\')">Regenerate</button>') +
         '<span class="muted" style="font-size:12px;margin-left:auto">' +
           (i + 1) + ' of ' + items.length + '</span>' +
       '</div>' +
@@ -1171,9 +1514,8 @@ document.addEventListener('keydown', e => {
     e.preventDefault();
     // The button is labelled "Approve & send" and you are looking at it.
     // A bare keypress is not, so this one asks first.
-    if (confirm('Send this email to ' + cur.to_email + ' now?')) {
-      outboxAct(cur.id, 'approve');
-    }
+    askConfirm('Send this email to ' + cur.to_email + ' now?', 'Send')
+      .then(function (go) { if (go) outboxAct(cur.id, 'approve'); });
   }
   else if (k === 'r' && cur) { e.preventDefault(); outboxAct(cur.id, 'reject'); }
 });
@@ -1194,10 +1536,75 @@ async function outboxAct(id, action) {
   loadOutbox();
 }
 
+function obNarrowed() { return !!(_ob.q || _ob.role); }
+
+// The ids currently on the review desk, which is the filtered list. Acting
+// on anything else would mean a button labelled with one number doing its
+// work to a different set of emails.
+function obPendingIds() { return (_desk.items || []).map(r => r.id); }
+
+async function obBulk(action, ids) {
+  return contactApi('/api/outbox/bulk', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ids: ids, action: action})
+  });
+}
+
 async function outboxApproveAll() {
-  const data = await api('/api/outbox/approve-all', {method: 'POST'});
-  if (data && data.success) showToast('Approved ' + data.approved + ' email(s).', 'success');
-  else showToast('Approve-all failed.', 'error');
+  const ids = obPendingIds();
+  if (!ids.length) return;
+  const data = await obBulk('approve', ids);
+  if (data && data.success) showToast('Approved ' + data.changed + ' email(s).', 'success');
+  else showToast((data && data.message) || 'Approve-all failed.', 'error');
+  loadOutbox();
+}
+
+async function outboxRegenerateAll() {
+  const ids = obPendingIds();
+  if (!ids.length) return;
+  // Rewriting replaces text a human may have edited by hand, so this asks
+  // even though nothing is sent and nothing is approved.
+  const what = obNarrowed()
+    ? 'the ' + ids.length + ' draft(s) currently shown'
+    : 'all ' + ids.length + ' draft(s) waiting for review';
+  var go = await askConfirm(
+    'Rewrite ' + what + ' from the template? Any wording you edited by hand '
+    + 'will be replaced. Nothing is sent.', 'Rewrite');
+  if (!go) return;
+
+  showToast('Rewriting ' + ids.length + ' draft(s)...', 'success');
+  const data = await contactApi('/api/outbox/regenerate-all', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ids: ids})
+  });
+  if (data && data.success) {
+    let msg = 'Rewrote ' + data.changed + ' draft(s).';
+    if (data.skipped) msg += ' ' + data.skipped + ' skipped.';
+    if (data.failed) msg += ' ' + data.failed + ' failed.';
+    showToast(msg, data.failed ? 'error' : 'success');
+    (data.notes || []).filter(noteWorthSaying).forEach(
+      n => showToast(n, 'success'));
+  } else {
+    showToast((data && data.message) || 'Rewrite failed.', 'error');
+  }
+  loadOutbox();
+}
+
+async function outboxRejectAll() {
+  const ids = obPendingIds();
+  if (!ids.length) return;
+  // Rejecting is one-way: a rejected email can no longer be approved or
+  // sent. Approving in bulk only stages, so only this one asks.
+  const what = obNarrowed()
+    ? 'the ' + ids.length + ' email(s) currently shown'
+    : 'all ' + ids.length + ' email(s) waiting for review';
+  var go = await askConfirm(
+    'Reject ' + what + '? Rejected emails cannot be approved or sent '
+    + 'afterwards.', 'Reject');
+  if (!go) return;
+  const data = await obBulk('reject', ids);
+  if (data && data.success) showToast('Rejected ' + data.changed + ' email(s).', 'success');
+  else showToast((data && data.message) || 'Reject-all failed.', 'error');
   loadOutbox();
 }
 
@@ -1279,6 +1686,40 @@ function fbProspect(i) {
 function fbCampaign(i) {
   const c = _campaigns[i];
   if (c) submitFeedback('campaign', c.id, 'Leave feedback on this campaign:');
+}
+
+async function findContacts() {
+  const btn = document.getElementById('find-contacts-btn');
+  const note = document.getElementById('find-contacts-note');
+  const say = (cls, text) => {
+    if (note) note.innerHTML = '<div class="test-result ' + cls + '">' + escHtml(text) + '</div>';
+  };
+  if (btn) { btn.disabled = true; btn.textContent = 'Reading sites...'; }
+  say('pending', 'Looking for published staff pages on companies already found.');
+
+  const d = await contactApi('/api/contacts/find', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({limit: 25})
+  });
+  if (!d || !d.success) {
+    if (btn) { btn.disabled = false; btn.textContent = 'Find contacts'; }
+    say('error', (d && d.message) || 'Could not start.');
+    return;
+  }
+  say('pending', 'Reading ' + d.companies + ' site(s). This takes a minute or two.');
+
+  // Poll rather than hold the request open: reading two dozen sites is
+  // minutes of work, and a hung request tells you nothing on the way.
+  const tick = setInterval(async () => {
+    const s = await contactApi('/api/contacts/find-status');
+    if (!s || s.running) return;
+    clearInterval(tick);
+    if (btn) { btn.disabled = false; btn.textContent = 'Find contacts'; }
+    if (s.error) { say('error', s.error); return; }
+    say(s.created ? 'success' : 'pending',
+        s.message + ' Checked ' + s.companies + ' company site(s).');
+    if (s.created) loadProspects();
+  }, 4000);
 }
 
 async function loadProspects() {
@@ -1808,7 +2249,8 @@ async function deleteContact(i) {
   const p = _prospects[i];
   if (!p) return;
   const who = ((p.first_name || '') + ' ' + (p.last_name || '')).trim() || p.email;
-  if (!confirm('Delete ' + who + '? This also cancels any mail still queued for them. It cannot be undone.')) return;
+  if (!await askConfirm('Delete ' + who + '? This also cancels any mail '
+      + 'still queued for them. It cannot be undone.', 'Delete')) return;
   const data = await contactApi('/api/contacts/' + encodeURIComponent(p.id), {method: 'DELETE'});
   if (data && data.success) { showToast('Contact deleted.', 'success'); loadProspects(); }
   else showToast((data && data.message) || 'Could not delete that contact.', 'error');
@@ -1820,6 +2262,95 @@ async function deleteContact(i) {
 // an email past the checks Harvey applies to its own writing.
 
 function deskEdit(id) { _desk.editing = id; loadOutbox(); }
+
+// Rewrite the draft in front of you from the template. Stays on the same
+// email afterwards: the point is to look at the new wording, and being
+// bounced back to the top of a queue of forty-four would defeat that.
+// window.confirm is not usable here. Some embedded browsers suppress the
+// native dialog and return false without ever showing it, which turns every
+// guarded action into a button that silently does nothing: no request, no
+// toast, no error. That is indistinguishable from a broken feature, and it
+// is how Regenerate, Reject all and Delete all came to "not work".
+//
+// This is a dialog in the page, so the answer is always the one the person
+// actually gave.
+var _confirmResolve = null;
+
+function askConfirm(message, confirmLabel) {
+  return new Promise(function (resolve) {
+    var root = document.getElementById('modal-root');
+    if (!root) { resolve(false); return; }
+    if (_confirmResolve) _confirmResolve(false);
+    _confirmResolve = resolve;
+    root.innerHTML =
+      '<div class="modal-backdrop" onclick="confirmBackdrop(event)">' +
+      '<div class="modal" role="dialog" aria-modal="true" aria-label="Confirm">' +
+        '<h2>Just checking</h2>' +
+        '<p class="lede">' + escHtml(message) + '</p>' +
+        '<div class="btn-group">' +
+          '<button class="btn btn-primary" id="confirm-yes" ' +
+            'onclick="confirmAnswer(true)">' +
+            escHtml(confirmLabel || 'Confirm') + '</button>' +
+          '<button class="btn btn-secondary" onclick="confirmAnswer(false)">' +
+            'Cancel</button>' +
+        '</div>' +
+      '</div></div>';
+    _modalEscHandler = function (e) {
+      if (e.key === 'Escape') confirmAnswer(false);
+    };
+    document.addEventListener('keydown', _modalEscHandler);
+    var yes = document.getElementById('confirm-yes');
+    if (yes) yes.focus();
+  });
+}
+
+function confirmAnswer(answer) {
+  var resolve = _confirmResolve;
+  _confirmResolve = null;
+  closeModal();
+  if (resolve) resolve(!!answer);
+}
+
+function confirmBackdrop(e) {
+  if (e && e.target && e.target.classList &&
+      e.target.classList.contains('modal-backdrop')) {
+    confirmAnswer(false);
+  }
+}
+
+// Which composition notes are worth interrupting someone for. A note that
+// a configuration field is empty is a standing fact about the setup, not
+// news about the draft just written, and it is already shown with the
+// readiness warnings before a run starts. Repeating it per click trains
+// people to ignore the toast that does matter.
+function noteWorthSaying(note) {
+  return !/not configured|No founder|No demo URL|No reply address|No organisation/i
+    .test(note || '');
+}
+
+async function deskRegenerate(id) {
+  var go = await askConfirm(
+    'Rewrite this email from the template? Any wording you edited by hand '
+    + 'will be replaced. Nothing is sent.', 'Rewrite');
+  if (!go) return;
+  const btn = document.getElementById('desk-regen');
+  if (btn) { btn.disabled = true; btn.textContent = 'Rewriting...'; }
+  const data = await contactApi(
+    '/api/outbox/' + encodeURIComponent(id) + '/regenerate', {method: 'POST'});
+  if (data && data.success) {
+    // Notes describe configuration, not a failure of this rewrite, so they
+    // are reported in the ordinary style. The red box made a working
+    // rewrite look broken.
+    showToast('Rewritten.', 'success');
+    (data.notes || []).filter(noteWorthSaying).forEach(
+      n => showToast(n, 'success'));
+  } else {
+    showToast((data && data.message) || 'Could not regenerate.', 'error');
+  }
+  const at = _desk.i;
+  await loadOutbox();
+  if (at < _desk.items.length) deskGo(at);
+}
 function deskCancelEdit() { _desk.editing = null; loadOutbox(); }
 
 async function deskSaveEdit(id) {
@@ -2180,7 +2711,7 @@ async function openComposer(i) {
     '<div id="gen-body"></div></div></div>';
   _modalEscHandler = e => { if (e.key === 'Escape') closeGenerator(); };
   document.addEventListener('keydown', _modalEscHandler);
-  const d = await contactApi('/api/contacts/generate-preview');
+  const d = await contactApi('/api/contacts/generate-preview' + genScopeQuery());
   const body = document.getElementById('gen-body');
   if (!body) return;
   if (!d || !d.success) {
@@ -2194,15 +2725,41 @@ async function openComposer(i) {
 function renderGenPreview(d) {
   const body = document.getElementById('gen-body');
   const sub = document.querySelector('.modal .modal-sub');
-  if (sub) sub.textContent = 'One personalised draft per contact, saved to the Outbox for your approval. Nothing is sent.';
+  if (sub) sub.textContent = 'One War Room beta invitation per contact, written for their role and saved to the Outbox for your approval. Nothing is sent.';
   const s = d.skipped || {};
   const cats = Object.keys(d.by_category || {})
     .map(k => catLabel(k) + ': ' + d.by_category[k]).join(', ');
+  const roleOpts = ['<option value="">Every category</option>'].concat(
+    (d.roles || []).filter(r => r.count).map(r =>
+      '<option value="' + escHtml(r.key) + '"' +
+      (_genScope.role === r.key ? ' selected' : '') + '>' +
+      escHtml(r.label) + ' (' + r.count + ')</option>')).join('');
+
+  const ready = d.readiness || {};
+  const warn = (ready.warnings || []).concat(
+    (ready.missing || []).length
+      ? ['Not configured yet: ' + (ready.missing || []).join(', ') +
+         '. Those sentences are left out of every email rather than guessed.']
+      : []);
+
   body.innerHTML =
+    (warn.length
+      ? '<div class="test-result error" style="margin-bottom:12px">' +
+        '<b>Before you send these</b><ul style="margin:6px 0 0 18px">' +
+        warn.map(w => '<li>' + escHtml(w) + '</li>').join('') + '</ul></div>'
+      : '') +
+    '<div class="form-group"><label class="form-label" for="gen-role">Who to write for</label>' +
+    '<select class="form-input" id="gen-role" onchange="setGenRole(this.value)">' +
+    roleOpts + '</select></div>' +
+    '<label style="display:flex;gap:8px;align-items:center;margin:0 0 12px;font-size:13px">' +
+    '<input type="checkbox" ' + (_genScope.regenerate ? 'checked ' : '') +
+    'onchange="setGenRegen(this.checked)"> Replace drafts that are still ' +
+    'waiting for review</label>' +
     '<div class="stats-grid" style="margin-bottom:12px">' +
     [['Contacts', d.total], ['Will generate', d.to_generate],
      ['No email', s.no_email || 0], ['Invalid email', s.bad_email || 0],
-     ['Suppressed', s.suppressed || 0], ['Already queued', s.already_queued || 0]]
+     ['Suppressed', s.suppressed || 0], ['Already queued', s.already_queued || 0],
+     ['Approved, left alone', s.approved_locked || 0]]
       .map(x => '<div class="stat-card"><div class="label">' + x[0] +
         '</div><div class="value">' + x[1] + '</div></div>').join('') +
     '</div>' +
@@ -2220,7 +2777,7 @@ function renderGenPreview(d) {
 async function refreshGenPreview() {
   const body = document.getElementById('gen-body');
   if (body) body.innerHTML = '<div class="test-result pending">Re-checking your contacts...</div>';
-  const d = await contactApi('/api/contacts/generate-preview');
+  const d = await contactApi('/api/contacts/generate-preview' + genScopeQuery());
   if (!d || !d.success) {
     if (body) body.innerHTML = '<div class="modal-error show">' +
       escHtml((d && d.message) || 'Could not read your contacts.') + '</div>';
@@ -2234,12 +2791,31 @@ function closeGenerator() {
   closeModal();
 }
 
+// What the next generation run is aimed at. Kept outside the modal so a
+// re-render of the preview does not silently reset the operator's choice.
+var _genScope = {role: '', regenerate: false, ids: []};
+
+function genScopeQuery() {
+  var p = [];
+  if (_genScope.role) p.push('role=' + encodeURIComponent(_genScope.role));
+  if (_genScope.regenerate) p.push('regenerate=true');
+  if (_genScope.ids.length) p.push('ids=' + encodeURIComponent(_genScope.ids.join(',')));
+  return p.length ? '?' + p.join('&') : '';
+}
+
+function setGenRole(v) { _genScope.role = v || ''; refreshGenPreview(); }
+function setGenRegen(v) { _genScope.regenerate = !!v; refreshGenPreview(); }
+
 async function startGeneration() {
   const btn = document.getElementById('gen-start');
   if (btn) { btn.disabled = true; btn.textContent = 'Starting...'; }
   const d = await contactApi('/api/contacts/generate', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({})
+    body: JSON.stringify({
+      role: _genScope.role,
+      regenerate: _genScope.regenerate,
+      ids: _genScope.ids
+    })
   });
   const body = document.getElementById('gen-body');
   if (!d || !d.success) {
@@ -2361,7 +2937,8 @@ async function deleteDiscoverConfig() {
   const sel = document.getElementById('disc-config-pick');
   const name = sel ? sel.value : '';
   if (!name) { showToast('Pick a saved search first.', 'error'); return; }
-  if (!confirm('Delete the saved search "' + name + '"?')) return;
+  if (!await askConfirm('Delete the saved search "' + name + '"?',
+                        'Delete')) return;
   const d = await contactApi('/api/discover/configs', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({name: name, delete: true})
@@ -2649,7 +3226,9 @@ async function gmailConnect() {
 })();
 
 async function gmailDisconnect() {
-  if (!confirm('Disconnect Gmail? This revokes the token at Google and deletes it here. Approved mail will stop sending until you reconnect.')) return;
+  if (!await askConfirm('Disconnect Gmail? This revokes the token at Google '
+      + 'and deletes it here. Approved mail will stop sending until you '
+      + 'reconnect.', 'Disconnect')) return;
   const d = await contactApi('/api/gmail/disconnect', {method: 'POST'});
   if (d && d.success) {
     showToast(d.revoked ? 'Disconnected and revoked at Google.'

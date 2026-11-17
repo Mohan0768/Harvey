@@ -4,6 +4,8 @@ import asyncio
 import json
 import logging
 import os
+import hashlib
+import hmac
 import re
 import secrets
 import signal
@@ -227,6 +229,40 @@ def _write_env_file(updates: dict[str, str]):
     load_dotenv(str(ENV_FILE), override=True)
 
 
+def _pid_is_alive(pid: int) -> bool:
+    """Whether a process with this id exists, on this platform.
+
+    os.kill(pid, 0) is the POSIX idiom for "does this exist", and on
+    Windows it raises WinError 87 because signal 0 is not a thing there.
+    That OSError was not caught below, so a single stale PID file made
+    every call to /api/harvey/status and /api/harvey/start return 500 —
+    the Start button could not work on Windows at all.
+    """
+    if sys.platform == "win32":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            # A finished process still has a handle; only STILL_ACTIVE means
+            # it is actually running.
+            return bool(ok) and code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def _check_harvey_pid() -> int | None:
     """Check if there's a running Harvey process from a PID file."""
     global _harvey_process, _harvey_started_at
@@ -235,10 +271,12 @@ def _check_harvey_pid() -> int | None:
     if PID_FILE.exists():
         try:
             pid = int(PID_FILE.read_text().strip())
-            os.kill(pid, 0)  # Check if process exists
-            return pid
-        except (ValueError, ProcessLookupError, PermissionError):
+        except (ValueError, OSError):
             PID_FILE.unlink(missing_ok=True)
+            return None
+        if _pid_is_alive(pid):
+            return pid
+        PID_FILE.unlink(missing_ok=True)
     return None
 
 
@@ -418,6 +456,10 @@ async def get_settings():
         "SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD",
         "IMAP_HOST", "IMAP_PORT", "IMAP_USERNAME", "IMAP_PASSWORD",
         "REOON_API_KEY", "ZEROBOUNCE_API_KEY", "HUNTER_API_KEY",
+        "SERPER_API_KEY", "DATAFORSEO_LOGIN", "DATAFORSEO_PASSWORD",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_GOOGLE_CLOUD_PROJECT", "ANTHROPIC_GOOGLE_CLOUD_WORKSPACE_ID",
+        "GOOGLE_APPLICATION_CREDENTIALS",
     ]
     for key in all_keys:
         if key not in env_vars:
@@ -450,9 +492,21 @@ async def get_settings():
         "smtp_password_set": is_set("SMTP_PASSWORD"),
         "imap_host": env_vars.get("IMAP_HOST", ""),
         "imap_port": env_vars.get("IMAP_PORT", ""),
+        # Discovery keys. Reported even in an export-only setup: finding
+        # people is the part that works without a mailbox at all.
+        "serper_api_key_set": is_set("SERPER_API_KEY"),
+        "dataforseo_login": env_vars.get("DATAFORSEO_LOGIN", ""),
+        "dataforseo_password_set": is_set("DATAFORSEO_PASSWORD"),
         "reoon_api_key_set": is_set("REOON_API_KEY"),
         "zerobounce_api_key_set": is_set("ZEROBOUNCE_API_KEY"),
         "hunter_api_key_set": is_set("HUNTER_API_KEY"),
+        # Where Harvey thinks. None of these is a secret: two ids and a path
+        # to a key file whose contents never come near this process.
+        "anthropic_api_key_set": is_set("ANTHROPIC_API_KEY"),
+        "brain_provider": _brain_provider(),
+        "gc_project": env_vars.get("ANTHROPIC_GOOGLE_CLOUD_PROJECT", ""),
+        "gc_workspace": env_vars.get("ANTHROPIC_GOOGLE_CLOUD_WORKSPACE_ID", ""),
+        "gc_credentials": env_vars.get("GOOGLE_APPLICATION_CREDENTIALS", ""),
     }
 
 
@@ -468,11 +522,28 @@ async def save_env_settings(request: Request):
     async with _env_lock:
         updates = {}
         for key in ["INSTANTLY_API_KEY", "LINKEDIN_EMAIL", "LINKEDIN_PASSWORD",
+                     # Where Harvey thinks. The API key IS a secret and is
+                     # handled like the others: written to .env, reported
+                     # back as a presence flag only, never echoed.
+                     "ANTHROPIC_API_KEY",
+                     # The rest are not secrets: two ids and a path to a key
+                     # file whose contents never pass through here.
+                     "GOOGLE_APPLICATION_CREDENTIALS",
+                     "ANTHROPIC_GOOGLE_CLOUD_PROJECT",
+                     "ANTHROPIC_GOOGLE_CLOUD_WORKSPACE_ID",
                      "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN",
                      "GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET",
+                     # The public callback, when Harvey is reached at
+                     # a real URL rather than through the loopback
+                     # listener. Empty means use the loopback flow.
+                     "GMAIL_REDIRECT_URI",
                      "SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD",
                      "IMAP_HOST", "IMAP_PORT", "IMAP_USERNAME", "IMAP_PASSWORD",
-                     "REOON_API_KEY", "ZEROBOUNCE_API_KEY", "HUNTER_API_KEY"]:
+                     "REOON_API_KEY", "ZEROBOUNCE_API_KEY", "HUNTER_API_KEY",
+                     # Discovery. Without these in the list the Settings
+                     # form could accept a key and quietly discard it.
+                     "SERPER_API_KEY",
+                     "DATAFORSEO_LOGIN", "DATAFORSEO_PASSWORD"]:
             if key in data and data[key] is not None:
                 # Strip newlines so a crafted value can't inject extra .env entries
                 updates[key] = str(data[key]).replace("\n", " ").replace("\r", " ").strip()
@@ -482,6 +553,22 @@ async def save_env_settings(request: Request):
             except Exception as e:
                 logger.warning("Failed to write .env: %s", e)
                 return {"success": False, "message": "Could not write .env file."}
+            # Into this process too, so a credential can be tested the
+            # moment it is saved. Writing only to .env leaves the running
+            # dashboard seeing nothing, and the Test button beside the field
+            # then reports the key missing right after you saved it, which
+            # is indistinguishable from the key being wrong.
+            for _k, _v in updates.items():
+                if _v:
+                    os.environ[_k] = _v
+                else:
+                    os.environ.pop(_k, None)
+            if "GOOGLE_APPLICATION_CREDENTIALS" in updates:
+                try:
+                    from harvey.brain import reset_google_credentials_cache
+                    reset_google_credentials_cache()
+                except Exception:
+                    pass
     return {"success": True}
 
 
@@ -612,7 +699,10 @@ async def start_harvey():
         log_handle = open(LOG_FILE, "a")
         try:
             _harvey_process = subprocess.Popen(
-                [sys.executable, "-m", "harvey"],
+                # "run" is not optional: without a subcommand the CLI prints its
+        # help and exits, so Start looked like it worked and the
+        # heartbeat never ran once.
+        [sys.executable, "-m", "harvey", "run"],
                 cwd=str(PROJECT_ROOT),
                 stdout=log_handle,
                 stderr=log_handle,
@@ -644,23 +734,27 @@ async def stop_harvey():
     if not pid:
         return {"success": False, "message": "Harvey is not running."}
 
+    # Windows has neither signal 0 nor SIGKILL: the first raises WinError 87
+    # and the second is not an attribute at all, so the old version of this
+    # could only ever fail there. _pid_is_alive handles the liveness check
+    # per platform, and SIGTERM maps to TerminateProcess on Windows.
     try:
         os.kill(pid, signal.SIGTERM)
-        # Wait briefly for graceful shutdown
-        for _ in range(10):
-            try:
-                os.kill(pid, 0)
-                await asyncio.sleep(0.5)
-            except ProcessLookupError:
-                break
-        else:
-            # Force kill if still running
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-    except (ProcessLookupError, PermissionError):
+    except OSError:
         pass
+
+    for _ in range(10):
+        if not _pid_is_alive(pid):
+            break
+        await asyncio.sleep(0.5)
+    else:
+        # Still up: force it, where the platform offers a way.
+        force = getattr(signal, "SIGKILL", None)
+        if force is not None:
+            try:
+                os.kill(pid, force)
+            except OSError:
+                pass
 
     _harvey_process = None
     _harvey_started_at = None
@@ -1058,11 +1152,153 @@ async def contacts_delete(prospect_id: str):
 _gmail_connect: dict = {"running": False, "ok": None, "message": ""}
 
 
+def _brain_provider() -> str:
+    """Which provider the config asks for, or "" when it cannot be read."""
+    try:
+        from harvey.config import load_config
+        return load_config().brain.provider
+    except Exception:
+        return ""
+
+
+@app.post("/api/brain/provider")
+async def set_brain_provider(request: Request):
+    """Write brain.provider into harvey.local.yaml.
+
+    The key lives in .env with the other credentials, but which provider to
+    use is configuration, and configuration lives in the yaml. Editing the
+    file by hand to change one word is a poor way to ask someone to finish
+    setting up.
+    """
+    try:
+        import re as _re
+
+        from harvey.config import BRAIN_PROVIDERS
+
+        body = await request.json()
+        provider = str(body.get("provider") or "").strip().lower()
+        if provider not in BRAIN_PROVIDERS:
+            return JSONResponse(
+                {"success": False,
+                 "message": provider + " is not a provider. Use one of: "
+                            + ", ".join(BRAIN_PROVIDERS) + "."},
+                status_code=400)
+
+        path = PROJECT_ROOT / "harvey.local.yaml"
+        if not path.is_file():
+            return JSONResponse(
+                {"success": False,
+                 "message": "harvey.local.yaml is missing, so there is "
+                            "nowhere to write this."},
+                status_code=400)
+
+        raw = path.read_text(encoding="utf-8")
+        newline = "\r\n" if "\r\n" in raw else "\n"
+        text = raw.replace("\r\n", "\n")
+        block = _re.search(r"^brain:\n(?:[ \t]+.*\n)*", text, _re.M)
+        line = '  provider: "' + provider + '"'
+        if block:
+            found = block.group(0)
+            if _re.search(r"^\s+provider:", found, _re.M):
+                replaced = _re.sub(r"^\s+provider:.*$", line, found, count=1,
+                                   flags=_re.M)
+            else:
+                replaced = found.rstrip("\n") + "\n" + line + "\n"
+            text = text.replace(found, replaced, 1)
+        else:
+            text = text.rstrip("\n") + "\n\nbrain:\n" + line + "\n"
+        path.write_text(text.replace("\n", newline), encoding="utf-8")
+        # A silence was earned by the provider being replaced, so it says
+        # nothing about this one.
+        _model_spoke()
+        return {"success": True, "provider": provider}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)},
+                            status_code=500)
+
+
+@app.get("/api/brain/status")
+async def brain_status():
+    """Whether Harvey can think, and what is missing when it cannot."""
+    try:
+        from harvey.brain import PROVIDER_LABELS, _google_credentials_problem
+        from harvey.config import load_config
+
+        cfg = load_config()
+        provider = cfg.brain.provider
+        label = PROVIDER_LABELS.get(provider, provider)
+
+        missing = []
+        if provider == "google_cloud":
+            if not (os.environ.get("ANTHROPIC_GOOGLE_CLOUD_PROJECT")
+                    or os.environ.get("GOOGLE_CLOUD_PROJECT")):
+                missing.append("project id")
+            if not os.environ.get("ANTHROPIC_GOOGLE_CLOUD_WORKSPACE_ID"):
+                missing.append("workspace id")
+            problem = _google_credentials_problem()
+            if problem:
+                missing.append("Google credentials")
+        elif provider == "anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
+            missing.append("ANTHROPIC_API_KEY")
+
+        ready = not missing
+        detail = (label + " is configured." if ready
+                  else label + " still needs: " + ", ".join(missing) + ".")
+        return {"success": True, "ready": ready, "provider": provider,
+                "label": label, "missing": missing, "detail": detail}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)},
+                            status_code=500)
+
+
+@app.post("/api/brain/test")
+async def brain_test():
+    """Ask the model one trivial question, and report what came back.
+
+    Settings that look right still fail when the role is missing or the key
+    file points nowhere, and nothing short of a real round trip tells you
+    which. One word of output keeps the check cheap.
+    """
+    try:
+        from harvey.brain import Brain, BrainUnavailable, PROVIDER_LABELS
+        from harvey.config import load_config
+
+        cfg = load_config()
+        state = _state()
+        await state.init_db()
+        brain = Brain(state, cfg.brain)
+        label = PROVIDER_LABELS.get(cfg.brain.provider, cfg.brain.provider)
+        try:
+            reply = await brain.think(
+                "Reply with the single word: ready", timeout=60,
+                max_retries=0, agent="dashboard", task="brain_test")
+        except BrainUnavailable as exc:
+            return JSONResponse({"success": False, "message": str(exc)},
+                                status_code=400)
+        if not reply:
+            return JSONResponse(
+                {"success": False,
+                 "message": label + " did not answer. Check the Activity log "
+                            "for the reason."},
+                status_code=400)
+        # The model answering is proof it can be reached, so drop any
+        # silence an earlier failure earned. Without this, a key pasted in
+        # after a failed attempt still gives template-only drafts for up to
+        # ten minutes, with nothing on screen to say why.
+        _model_spoke()
+        return {"success": True, "provider": label, "reply": reply[:200]}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)},
+                            status_code=500)
+
+
 @app.get("/api/gmail/status")
 async def gmail_status():
     """Real connection state. Never guessed from the presence of a key."""
     try:
-        from harvey.integrations.gmail import SCOPE, TOKEN_FILE, LOOPBACK_PORT
+        from harvey.integrations.gmail import (
+            SCOPE, TOKEN_FILE, LOOPBACK_PORT, LOOPBACK_REDIRECT_HOST,
+            hosted_redirect_uri)
         from harvey.config import load_env
 
         env = load_env()
@@ -1095,7 +1331,12 @@ async def gmail_status():
             "detail": detail,
             "address": address,
             "scope": (token or {}).get("scope") or SCOPE,
-            "redirect_uri": "http://localhost:" + str(LOOPBACK_PORT),
+            # Whichever one is really in play. Showing the loopback
+            # URI while a hosted one is configured sends people to
+            # register the wrong string in Google Console.
+            "redirect_uri": hosted_redirect_uri() or (
+                "http://" + LOOPBACK_REDIRECT_HOST + ":" + str(LOOPBACK_PORT)),
+            "flow": "redirect" if hosted_redirect_uri() else "loopback",
             "token_path": str(TOKEN_FILE),
             "connecting": _gmail_connect,
         }
@@ -1104,17 +1345,60 @@ async def gmail_status():
                             status_code=500)
 
 
-# Outstanding OAuth states for the hosted flow: issued here, returned by
-# Google, used once. Without this check anyone could hand the callback a
-# code of their choosing.
-_oauth_states: dict[str, float] = {}
+# OAuth state for the hosted flow: issued here, returned by Google, checked
+# on the way back. Without it anyone could hand the callback a code of
+# their choosing.
+#
+# The state is SIGNED rather than stored, and that is the whole point. An
+# in-memory set of outstanding states does not survive a restart, so any
+# restart between pressing Connect and returning from Google silently
+# invalidates a sign-in that actually worked. A signed token carries its
+# own issue time and needs no server memory, so a restart mid-flow is
+# harmless. _used still blocks replay while the process lives; losing that
+# set on restart costs nothing, because the authorization code inside is
+# single-use at Google anyway.
 OAUTH_STATE_TTL = 900
+_used_oauth_states: set[str] = set()
 
 
-def _prune_oauth_states():
-    cutoff = time.time() - OAUTH_STATE_TTL
-    for key in [k for k, born in _oauth_states.items() if born < cutoff]:
-        _oauth_states.pop(key, None)
+def _oauth_secret() -> bytes:
+    """Stable signing key. HARVEY_SESSION_SECRET when set, otherwise derived
+    from the client secret, which is already secret and already stable."""
+    explicit = (os.getenv("HARVEY_SESSION_SECRET") or "").strip()
+    if explicit:
+        return explicit.encode()
+    return hashlib.sha256(
+        b"harvey-oauth:" + (os.getenv("GMAIL_CLIENT_SECRET") or "").encode()
+    ).digest()
+
+
+def _issue_oauth_state() -> str:
+    payload = str(int(time.time())) + "." + secrets.token_urlsafe(8)
+    sig = hmac.new(_oauth_secret(), payload.encode(), hashlib.sha256).hexdigest()
+    return payload + "." + sig[:32]
+
+
+def _oauth_state_ok(raw: str) -> tuple[bool, str]:
+    """(accepted, why not). Signature first, then age, then replay."""
+    if not raw or raw.count(".") != 2:
+        return False, "no sign-in state came back from Google."
+    issued, nonce, sig = raw.split(".")
+    expected = hmac.new(
+        _oauth_secret(), (issued + "." + nonce).encode(), hashlib.sha256
+    ).hexdigest()[:32]
+    if not hmac.compare_digest(sig, expected):
+        return False, ("that sign-in did not come from this Harvey. Press "
+                       "Connect Gmail here and try again.")
+    try:
+        age = time.time() - int(issued)
+    except ValueError:
+        return False, "the sign-in state was malformed."
+    if age < -60 or age > OAUTH_STATE_TTL:
+        return False, "that sign-in link has expired. Press Connect Gmail again."
+    if raw in _used_oauth_states:
+        return False, "that sign-in link has already been used."
+    _used_oauth_states.add(raw)
+    return True, ""
 
 
 @app.get("/oauth/google/callback")
@@ -1128,15 +1412,23 @@ async def gmail_oauth_callback(request: Request):
     from harvey.integrations.gmail import exchange_code, hosted_redirect_uri
 
     def done(ok: bool, message: str):
+        # Logged as well as shown. A redirect carries its reason in a
+        # query string the browser then throws away, which leaves
+        # nothing to diagnose from afterwards.
+        (logger.info if ok else logger.warning)(
+            "gmail oauth callback: %s - %s",
+            "connected" if ok else "failed", message[:200])
         return RedirectResponse(
             "/?gmail=" + ("connected" if ok else "failed") +
             "&detail=" + urllib.parse.quote(message[:200]), status_code=303)
 
     params = request.query_params
+    logger.info("gmail oauth callback reached: has_code=%s has_error=%s",
+                bool(params.get("code")), params.get("error") or "no")
     state = params.get("state", "")
-    _prune_oauth_states()
-    if not state or _oauth_states.pop(state, None) is None:
-        return done(False, "That sign-in link has expired. Press Connect Gmail again.")
+    accepted, why = _oauth_state_ok(state)
+    if not accepted:
+        return done(False, why)
     if params.get("error"):
         return done(False, "Google said: " + params["error"])
     code = params.get("code", "")
@@ -1173,9 +1465,7 @@ async def gmail_connect():
         # server, and the consent screen can never find its way back.
         hosted = hosted_redirect_uri()
         if hosted:
-            state = secrets.token_urlsafe(16)
-            _oauth_states[state] = time.time()
-            _prune_oauth_states()
+            state = _issue_oauth_state()
             return {"success": True, "mode": "redirect",
                     "url": build_auth_url(env.gmail_client_id, hosted, state)}
 
@@ -1184,20 +1474,30 @@ async def gmail_connect():
                                  "message": "A connection attempt is already open."},
                                 status_code=409)
 
-        _gmail_connect = {"running": True, "ok": None,
+        _gmail_connect = {"running": True, "ok": None, "auth_url": "",
                           "message": "Waiting for Google sign-in in your browser."}
+
+        def _remember_url(url: str):
+            # Kept so the card can offer the link: the system default
+            # browser is not always the one signed into Google.
+            _gmail_connect["auth_url"] = url
+
+        reason: list[str] = []
 
         async def _go():
             global _gmail_connect
             try:
                 ok = await asyncio.to_thread(
-                    run_auth_flow, env.gmail_client_id, env.gmail_client_secret)
+                    run_auth_flow, env.gmail_client_id, env.gmail_client_secret,
+                    _remember_url, reason.append)
+                # The flow knows why it failed. Showing one stock sentence
+                # for every cause sent us chasing a missing refresh token
+                # that was never the problem.
                 _gmail_connect = {
                     "running": False, "ok": bool(ok),
                     "message": ("Connected." if ok else
-                                "Google did not return a refresh token. Remove "
-                                "Harvey from your account's third-party access "
-                                "list and try again."),
+                                (reason[-1] if reason else
+                                 "The sign-in did not complete.")),
                 }
             except Exception as exc:
                 logger.exception("gmail connect failed")
@@ -1305,18 +1605,20 @@ _EMAIL_TYPE = {"manual": "Custom", "sequence": "Automated", "reply": "Reply"}
 async def _decorate_outbox(rows: list) -> list:
     """Attach the recipient's name to each row.
 
-    The address alone is a poor thing to approve against: "ymalave@mdc.edu"
+    The address alone is a poor thing to approve against: "jlee@example.edu"
     does not tell you who you are writing to, and the whole point of this
     screen is an informed yes or no.
     """
+    from harvey import roles
+
     rows = list(rows or [])
     ids = {r.get("prospect_id") for r in rows if r.get("prospect_id")}
     names = {}
     if ids:
         marks = ",".join("?" * len(ids))
         for p in await query_db(
-            "SELECT id, first_name, last_name, company, department "
-            "FROM prospects WHERE id IN (" + marks + ")", tuple(ids)
+            "SELECT id, first_name, last_name, company, department, title, "
+            "category FROM prospects WHERE id IN (" + marks + ")", tuple(ids)
         ):
             names[p["id"]] = p
     for r in rows:
@@ -1326,6 +1628,10 @@ async def _decorate_outbox(rows: list) -> list:
         r["recipient_name"] = full
         r["recipient_company"] = who.get("company") or ""
         r["recipient_department"] = who.get("department") or ""
+        r["recipient_title"] = who.get("title") or ""
+        role = roles.resolve(who) if who else ""
+        r["role"] = role
+        r["role_label"] = roles.label(role)
         r["email_type"] = _EMAIL_TYPE.get(r.get("kind") or "", "Automated")
     return rows
 
@@ -1378,20 +1684,40 @@ async def outbox_approve_all():
 _BULK_SKIP_STATUSES = {"replied", "opted_out", "lost", "meeting", "closed"}
 
 
-async def _bulk_eligibility(state):
-    """Split every contact into generate / skip, with the reason for each skip."""
+async def _bulk_eligibility(state, ids=None, role="", regenerate=False):
+    """Split the chosen contacts into generate / skip, with a reason per skip.
+
+    ``ids`` narrows the run to specific contacts and ``role`` to one role, so
+    the same rules cover one contact, a hand-picked few, a whole category and
+    everybody. The filters are applied BEFORE the skip counting, so a run
+    aimed at eight people never reports on the other forty-eight.
+
+    ``regenerate`` lets a contact through who already has a draft waiting.
+    An APPROVED draft still blocks: approval is the one decision that lets
+    mail out, and rewriting past it would quietly undo a human yes.
+    """
+    from harvey import roles
     from harvey.importer import EMAIL_RE
 
     rows = await query_db("SELECT * FROM prospects ORDER BY created_at DESC")
-    queued_rows = await query_db(
-        "SELECT DISTINCT prospect_id FROM outbox "
-        "WHERE status IN ('pending_review', 'approved')")
-    queued = {r["prospect_id"] for r in queued_rows if r["prospect_id"]}
+    targets = rows
+    if ids:
+        wanted = {str(x) for x in ids}
+        targets = [r for r in targets if r["id"] in wanted]
+    if role:
+        targets = [r for r in targets if roles.resolve(r) == role]
+
+    approved_rows = await query_db(
+        "SELECT DISTINCT prospect_id FROM outbox WHERE status = 'approved'")
+    approved = {r["prospect_id"] for r in approved_rows if r["prospect_id"]}
+    pending_rows = await query_db(
+        "SELECT DISTINCT prospect_id FROM outbox WHERE status = 'pending_review'")
+    pending = {r["prospect_id"] for r in pending_rows if r["prospect_id"]}
 
     eligible = []
     skipped = {"no_email": 0, "bad_email": 0, "suppressed": 0,
-               "already_queued": 0}
-    for r in rows:
+               "already_queued": 0, "approved_locked": 0}
+    for r in targets:
         email = (r.get("email") or "").strip().lower()
         if not email:
             skipped["no_email"] += 1
@@ -1399,20 +1725,112 @@ async def _bulk_eligibility(state):
             skipped["bad_email"] += 1
         elif (r.get("status") or "") in _BULK_SKIP_STATUSES:
             skipped["suppressed"] += 1
-        elif r["id"] in queued:
+        elif r["id"] in approved:
+            skipped["approved_locked"] += 1
+        elif r["id"] in pending and not regenerate:
             skipped["already_queued"] += 1
         else:
             eligible.append(r)
     return rows, eligible, skipped
 
 
-@app.get("/api/contacts/generate-preview")
-async def contacts_generate_preview():
-    """What a bulk run would do. Writes nothing, generates nothing."""
+# One on-demand contacts pass. Discovery adds institutions; only Scout
+# turns them into named people, and the heartbeat reaches Scout only when
+# the pipeline is thin. Without this, a discovery run that found 40
+# colleges had no way to become 40 colleges' worth of contacts.
+_find_contacts: dict = {"running": False, "created": 0, "companies": 0,
+                        "message": "", "error": ""}
+_find_contacts_task = None
+
+
+@app.get("/api/contacts/find-status")
+async def contacts_find_status():
+    return {"success": True, **_find_contacts}
+
+
+@app.post("/api/contacts/find")
+async def contacts_find(request: Request):
+    """Mine companies already on file for named people.
+
+    Runs Scout's known-companies backfill, which reads each company's own
+    site rather than paying for searches, so it costs no Serper credit.
+    """
+    global _find_contacts, _find_contacts_task
+
+    if _find_contacts.get("running"):
+        return JSONResponse({"success": False, "message": "Already running."},
+                            status_code=409)
     try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    limit = max(1, min(int(body.get("limit") or 25), 100))
+
+    from harvey.agents.scout import Scout
+    from harvey.brain import Brain
+    from harvey.config import load_config, load_env
+
+    state = _state()
+    await state.init_db()
+    pending = await state.companies_needing_prospects(limit=limit)
+    if not pending:
+        return JSONResponse(
+            {"success": False,
+             "message": "Every company on file has been checked for contacts "
+                        "already. Run Discovery to add more."},
+            status_code=400)
+
+    config, env = load_config(), load_env()
+    _find_contacts = {"running": True, "created": 0, "companies": len(pending),
+                      "message": "Reading " + str(len(pending)) + " site(s)...",
+                      "error": ""}
+
+    async def _go():
+        global _find_contacts
+        try:
+            brain = Brain(state, config.brain)
+            scout = Scout(brain, state, config, env)
+            # Scout normally loads these in run(); this calls one strategy
+            # directly, so the same setup has to happen here.
+            scout.skills = ""
+            created = await scout._prospect_via_known_companies(limit=limit)
+            _find_contacts = {
+                "running": False, "created": created,
+                "companies": len(pending), "error": "",
+                "message": (str(created) + " contact(s) found."
+                            if created else
+                            "No published contacts found on those sites."),
+            }
+        except Exception as exc:
+            logger.exception("find contacts failed")
+            _find_contacts = {"running": False, "created": 0,
+                              "companies": len(pending),
+                              "message": "", "error": str(exc)}
+
+    _find_contacts_task = asyncio.create_task(_go())
+    return {"success": True, "companies": len(pending)}
+
+
+@app.get("/api/contacts/generate-preview")
+async def contacts_generate_preview(ids: str = "", role: str = "",
+                                    regenerate: bool = False):
+    """What a run would do, for exactly the scope asked about.
+
+    The scope arguments mirror /api/contacts/generate so the count on the
+    button is the count the button will actually write. A preview computed
+    over everyone while the run is narrowed to one category is worse than
+    no preview at all.
+    """
+    try:
+        from harvey import outreach
+        from harvey import roles as role_rules
+        from harvey.config import load_config
+
         state = _state()
         await state.init_db()
-        rows, eligible, skipped = await _bulk_eligibility(state)
+        wanted = [x.strip() for x in ids.split(",") if x.strip()]
+        rows, eligible, skipped = await _bulk_eligibility(
+            state, ids=wanted, role=role, regenerate=regenerate)
 
         by_category = {}
         for r in eligible:
@@ -1425,6 +1843,12 @@ async def contacts_generate_preview():
             "to_generate": len(eligible),
             "skipped": skipped,
             "by_category": by_category,
+            "roles": [{"key": key, "label": lbl,
+                       "count": sum(1 for r in rows
+                                    if role_rules.resolve(r) == key)}
+                      for key, lbl in role_rules.known_roles()],
+            "unclassified": sum(1 for r in rows if not role_rules.resolve(r)),
+            "readiness": outreach.readiness(load_config()),
         }
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)},
@@ -1456,21 +1880,28 @@ async def contacts_generate(request: Request):
         raw = await request.body()
         body = await request.json() if raw else {}
         limit = int(body.get("limit") or 0)
+        ids = [str(x) for x in (body.get("ids") or []) if str(x).strip()]
+        role = str(body.get("role") or "").strip()
+        regenerate = bool(body.get("regenerate"))
+        use_model = body.get("use_model")
+        use_model = True if use_model is None else bool(use_model)
 
         state = _state()
         await state.init_db()
-        _, eligible, _ = await _bulk_eligibility(state)
+        _, eligible, skipped = await _bulk_eligibility(
+            state, ids=ids, role=role, regenerate=regenerate)
         if limit:
             eligible = eligible[:limit]
         if not eligible:
             return JSONResponse(
-                {"success": False, "message": "No eligible contacts to write for."},
+                {"success": False,
+                 "message": _no_generate_message(skipped, bool(ids or role))},
                 status_code=400)
 
         started = time.time()
         _generate_progress = {"done": 0, "total": len(eligible), "contact": "",
                               "created": 0, "failed": 0, "blocked": 0,
-                              "started_at": started, "errors": []}
+                              "started_at": started, "errors": [], "notes": []}
 
         async def _go():
             try:
@@ -1486,16 +1917,29 @@ async def contacts_generate(request: Request):
         async def _generate_all():
             from datetime import datetime, timezone
 
-            from harvey.agents.writer import Writer
+            from harvey import outreach
             from harvey.brain import Brain
-            from harvey.config import load_config, load_env
+            from harvey.config import load_config
             from harvey.gate import pre_send_check
             from harvey.models.prospect import Prospect
 
             cfg = load_config()
-            writer = Writer(Brain(state, cfg.brain), state, cfg, load_env())
-            writer.skills = writer.brain.load_skills_for_agent("writer")
             provider = _current_provider()
+
+            # The invitation is assembled in code and only then handed to the
+            # model to reword. That ordering is the whole safety story: a run
+            # with no model signed in still produces complete, sendable,
+            # factually clean mail, and a model that is signed in can only
+            # improve the prose, never introduce a fact or a link.
+            brain = None
+            model_misses = 0
+            if use_model:
+                try:
+                    brain = Brain(state, cfg.brain)
+                except Exception as exc:
+                    _generate_progress["errors"].append(
+                        "model unavailable, wrote composed wording: "
+                        + str(exc)[:120])
 
             for i, row in enumerate(eligible):
                 _generate_progress["done"] = i
@@ -1506,13 +1950,37 @@ async def contacts_generate(request: Request):
                     fields = {k: v for k, v in row.items()
                               if k in Prospect.model_fields}
                     prospect = Prospect(**fields)
-                    draft = await writer._write_personal_email(prospect)
-                    if not draft:
-                        _generate_progress["failed"] += 1
-                        if len(_generate_progress["errors"]) < 8:
-                            _generate_progress["errors"].append(
-                                prospect.email + ": the model returned nothing")
-                        continue
+
+                    composed = outreach.compose(row, cfg)
+                    if brain is not None:
+                        before = len(composed.notes)
+                        composed = await outreach.refine(
+                            composed, row, cfg, brain)
+                        # A model that is signed out fails for contact one
+                        # and for all fifty. Asking it every time would turn
+                        # a two second run into a forty minute one, so after
+                        # two refusals the rest of the run is composed only.
+                        if any("kept" in n for n in composed.notes[before:]):
+                            model_misses += 1
+                            if model_misses >= 2:
+                                brain = None
+                                _generate_progress["errors"].append(
+                                    "Model is not answering, so the rest of "
+                                    "this run uses the composed wording.")
+                        else:
+                            model_misses = 0
+                    draft = {"subject": composed.subject,
+                             "body": composed.body}
+                    for note in composed.notes:
+                        if note not in _generate_progress["notes"]:
+                            _generate_progress["notes"].append(note)
+
+                    # Replacing a draft the reviewer has not acted on yet is
+                    # fine; it is cancelled rather than deleted so the Outbox
+                    # shows that a previous version existed.
+                    if regenerate:
+                        await state.cancel_pending_review_for_prospect(
+                            prospect.id, "replaced by a regenerated draft")
 
                     check = pre_send_check(prospect.email, draft["subject"],
                                            draft["body"], prospect=prospect,
@@ -2015,6 +2483,303 @@ async def outbox_edit(item_id: str, request: Request):
                             status_code=500)
 
 
+def _no_generate_message(skipped: dict, narrowed: bool) -> str:
+    """Say which rule emptied the run, not just that it is empty."""
+    if skipped.get("already_queued"):
+        return (str(skipped["already_queued"]) + " contact(s) already have a "
+                "draft waiting for review. Tick Replace existing drafts to "
+                "write them again.")
+    if skipped.get("approved_locked"):
+        return (str(skipped["approved_locked"]) + " contact(s) have an "
+                "approved email waiting to send, which is left alone. "
+                "Reject it first if you want a new draft.")
+    if skipped.get("no_email") or skipped.get("bad_email"):
+        return ("No contact in this selection has a usable email address.")
+    if skipped.get("suppressed"):
+        return ("Every contact in this selection has replied or opted out.")
+    if narrowed:
+        return "No contact matches that selection."
+    return "No eligible contacts to write for."
+
+
+@app.get("/api/outreach/readiness")
+async def outreach_readiness():
+    """What is still missing before any invitation should go out."""
+    try:
+        from harvey import outreach
+        from harvey.config import load_config
+        return {"success": True, **outreach.readiness(load_config())}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)},
+                            status_code=500)
+
+
+@app.get("/api/outbox/item/{item_id}")
+async def outbox_item(item_id: str):
+    """One email exactly as stored, for the preview screen.
+
+    This re-reads the row and composes nothing. Opening a preview must never
+    change what it is previewing: the point of the screen is to show what was
+    approved, and a preview that regenerates shows something that was not.
+    """
+    try:
+        state = _state()
+        await state.init_db()
+        item = await state.get_outbox_item(item_id)
+        if item is None:
+            return JSONResponse(
+                {"success": False, "message": "That email no longer exists."},
+                status_code=404)
+        decorated = await _decorate_outbox([dict(item)])
+        return {"success": True, "item": decorated[0]}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)},
+                            status_code=500)
+
+
+# A model that is signed out fails the same way every time, and each
+# failure costs the full timeout. On a button someone clicks once per draft
+# that is fifteen seconds of nothing, over and over. After one failure the
+# model is left alone for a while and drafts come straight from the
+# template, which is what it would have fallen back to anyway.
+_MODEL_SILENCE_SECONDS = 600
+_model_quiet_until = 0.0
+
+
+def _model_is_quiet() -> bool:
+    return time.time() < _model_quiet_until
+
+
+def _remember_model_silence():
+    global _model_quiet_until
+    _model_quiet_until = time.time() + _MODEL_SILENCE_SECONDS
+
+
+def _model_spoke():
+    global _model_quiet_until
+    _model_quiet_until = 0.0
+
+
+@app.post("/api/outbox/regenerate-all")
+async def outbox_regenerate_all(request: Request):
+    """Rewrite several drafts from the template, in place.
+
+    Takes the ids the screen is showing, so the button acts on exactly what
+    it is labelled with. Only drafts are touched: an approved email has
+    cleared the one gate that lets mail out, and a sent one cannot be
+    unsent, so rewriting either would be a lie about what went out.
+
+    Each email is composed in code and only then handed to the model to fix
+    wording and grammar. With no model signed in, every draft is still
+    rewritten from the template; the model never gets to add a fact.
+    """
+    try:
+        from harvey import outreach
+        from harvey.brain import Brain
+        from harvey.config import load_config
+        from harvey.gate import pre_send_check
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        ids = [str(x) for x in (body.get("ids") or []) if str(x).strip()]
+        use_model = body.get("use_model")
+        use_model = True if use_model is None else bool(use_model)
+
+        state = _state()
+        await state.init_db()
+
+        if not ids:
+            rows = await state.get_outbox(status="pending_review", limit=500)
+            ids = [r["id"] for r in rows]
+        if not ids:
+            return JSONResponse(
+                {"success": False, "message": "There are no drafts to rewrite."},
+                status_code=400)
+
+        cfg = load_config()
+        brain = None
+        model_misses = 0
+        if use_model and not _model_is_quiet():
+            try:
+                brain = Brain(state, cfg.brain)
+            except Exception:
+                brain = None
+
+        changed, skipped, failed, errors, notes = 0, 0, 0, [], []
+        for item_id in ids:
+            item = await state.get_outbox_item(item_id)
+            if item is None:
+                skipped += 1
+                continue
+            if (item.get("status") or "") not in ("draft", "pending_review",
+                                                  "failed"):
+                skipped += 1
+                continue
+            prospects = await query_db(
+                "SELECT * FROM prospects WHERE id = ?",
+                (item.get("prospect_id") or "",))
+            if not prospects:
+                # Nothing to personalise from, so leave the hand-written
+                # text alone rather than replacing it with a generic one.
+                skipped += 1
+                continue
+
+            row = prospects[0]
+            try:
+                draft = outreach.recompose(row, cfg, item.get("body") or "")
+                if brain is not None:
+                    before = len(draft.notes)
+                    draft = await outreach.refine(draft, row, cfg, brain)
+                    # A model that is signed out fails for the first draft
+                    # and for all forty-six. Asking it every time would turn
+                    # a two second rewrite into a twelve minute one.
+                    if any("kept" in n for n in draft.notes[before:]):
+                        model_misses += 1
+                        if model_misses >= 2:
+                            brain = None
+                            _remember_model_silence()
+                            notes.append("The model is not answering, so the "
+                                         "rest were written from the "
+                                         "template only.")
+                    else:
+                        model_misses = 0
+
+                check = pre_send_check(item["to_email"], draft.subject,
+                                       draft.body,
+                                       kind=item.get("kind") or "manual")
+                blocking = [r for r in check.reasons
+                            if "email_status" not in r
+                            and "recipient" not in r]
+                if blocking:
+                    failed += 1
+                    if len(errors) < 8:
+                        errors.append(item["to_email"] + ": "
+                                      + "; ".join(blocking))
+                    continue
+
+                await state.update_outbox_item(
+                    item_id, subject=draft.subject, body=draft.body)
+                changed += 1
+            except Exception as exc:
+                logger.exception("regenerate-all failed for one draft")
+                failed += 1
+                if len(errors) < 8:
+                    errors.append(str(exc)[:160])
+
+        return {"success": True, "changed": changed, "skipped": skipped,
+                "failed": failed, "errors": errors, "notes": notes}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)},
+                            status_code=500)
+
+
+@app.post("/api/outbox/{item_id}/regenerate")
+async def outbox_regenerate(item_id: str):
+    """Write this contact a fresh invitation, replacing the stored one.
+
+    Only before approval. An approved email may already be mid-flight and a
+    sent one cannot be unsent, so regenerating either would be a lie about
+    what went out.
+    """
+    try:
+        from harvey import outreach
+        from harvey.brain import Brain
+        from harvey.config import load_config
+        from harvey.gate import pre_send_check
+
+        state = _state()
+        await state.init_db()
+        item = await state.get_outbox_item(item_id)
+        if item is None:
+            return JSONResponse(
+                {"success": False, "message": "That email no longer exists."},
+                status_code=404)
+        if (item.get("status") or "") not in ("draft", "pending_review", "failed"):
+            return JSONResponse(
+                {"success": False,
+                 "message": "Only a draft can be regenerated; this one is "
+                            + (item.get("status") or "unknown") + "."},
+                status_code=400)
+
+        rows = await query_db("SELECT * FROM prospects WHERE id = ?",
+                              (item.get("prospect_id") or "",))
+        if not rows:
+            return JSONResponse(
+                {"success": False,
+                 "message": "This email is not linked to a contact, so there "
+                            "is nothing to personalise from. Edit it instead."},
+                status_code=400)
+
+        cfg = load_config()
+        row = rows[0]
+        # Different wording from what is on screen, because that is what
+        # the person clicking Regenerate is asking for.
+        draft = outreach.recompose(row, cfg, item.get("body") or "")
+        if not _model_is_quiet():
+            try:
+                # Someone is watching a spinner, so the model gets a
+                # shorter leash here than the bulk path. Not 15 seconds
+                # though: a large model writing 200 words can take longer
+                # than that, and a timeout here does not just lose one
+                # rewrite, it trips the ten minute silence below and makes
+                # every regenerate after it template-only.
+                before = len(draft.notes)
+                draft = await outreach.refine(draft, row, cfg,
+                                              Brain(state, cfg.brain),
+                                              timeout=30)
+                if any("kept" in n for n in draft.notes[before:]):
+                    _remember_model_silence()
+                else:
+                    _model_spoke()
+            except Exception:
+                _remember_model_silence()
+
+        check = pre_send_check(item["to_email"], draft.subject, draft.body,
+                               kind=item.get("kind") or "manual")
+        blocking = [r for r in check.reasons
+                    if "email_status" not in r and "recipient" not in r]
+        if blocking:
+            return JSONResponse(
+                {"success": False,
+                 "message": "The regenerated email would not pass the gate: "
+                            + "; ".join(blocking)},
+                status_code=400)
+
+        await state.update_outbox_item(item_id, subject=draft.subject,
+                                       body=draft.body)
+        return {"success": True, "subject": draft.subject, "body": draft.body,
+                "role": draft.role, "notes": draft.notes}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)},
+                            status_code=500)
+
+
+@app.delete("/api/outbox/{item_id}")
+async def outbox_delete(item_id: str):
+    """Delete an unwanted draft. Sent and in-flight mail is never deletable."""
+    try:
+        state = _state()
+        await state.init_db()
+        item = await state.get_outbox_item(item_id)
+        if item is None:
+            return JSONResponse(
+                {"success": False, "message": "That email no longer exists."},
+                status_code=404)
+        if (item.get("status") or "") in ("sent", "sending"):
+            return JSONResponse(
+                {"success": False,
+                 "message": "This email has already been sent, so it stays on "
+                            "the record. Nothing can un-send it."},
+                status_code=400)
+        ok = await state.delete_outbox_item(item_id)
+        return {"success": bool(ok), "deleted": bool(ok)}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)},
+                            status_code=500)
+
+
 @app.post("/api/outbox/{item_id}/approve")
 async def outbox_approve(item_id: str):
     """Approve this one email and send it, now, through the mail provider.
@@ -2075,6 +2840,55 @@ async def sending_toggle(action: str):
         return {"success": True}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+@app.get("/api/export/outbox.csv")
+async def export_outbox(ids: str = "", status: str = "", role: str = ""):
+    """Download the exact emails, filtered the same way the screen is.
+
+    ``ids`` exports a hand-picked selection, ``status`` and ``role`` export a
+    slice. With none of them you get everything, which is the usual case for
+    a record you intend to keep.
+    """
+    from harvey.export import outbox_rows_to_csv
+
+    try:
+        state = _state()
+        await state.init_db()
+
+        clauses, params = [], []
+        wanted_ids = [x.strip() for x in ids.split(",") if x.strip()]
+        if wanted_ids:
+            clauses.append("id IN (" + ",".join("?" * len(wanted_ids)) + ")")
+            params.extend(wanted_ids)
+        wanted_status = [x.strip() for x in status.split(",") if x.strip()]
+        if wanted_status:
+            clauses.append("status IN ("
+                           + ",".join("?" * len(wanted_status)) + ")")
+            params.extend(wanted_status)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = await query_db(
+            "SELECT * FROM outbox" + where + " ORDER BY created_at DESC",
+            tuple(params))
+
+        rows = await _decorate_outbox([dict(r) for r in rows])
+        # Role lives on the contact, not the outbox row, so it can only be
+        # filtered after decoration. "__none__" means the contacts whose
+        # title named no role: an empty string here has to keep meaning "no
+        # filter at all", so unclassified needs a value of its own.
+        if role == "__none__":
+            rows = [r for r in rows if not r.get("role")]
+        elif role:
+            rows = [r for r in rows if r.get("role") == role]
+
+        text = outbox_rows_to_csv(rows)
+        return Response(
+            content=text, media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition":
+                     "attachment; filename=harvey-outbox.csv"})
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)},
+                            status_code=500)
 
 
 @app.get("/api/export/prospects.csv")
@@ -2235,7 +3049,15 @@ _generate_task: asyncio.Task | None = None
 _generate_progress: dict | None = None
 
 
-def _discovery_queries(body: dict, config):
+def _discovery_signature(body: dict) -> str:
+    """Identifies "the same search" across runs, so a repeat can go deeper."""
+    cities = sorted(c.strip().lower() for c in (body.get("cities") or []) if c.strip())
+    terms = sorted(t.strip().lower() for t in (body.get("terms") or []) if t.strip())
+    return hashlib.sha256(
+        ("|".join(terms) + "::" + "|".join(cities)).encode()).hexdigest()[:16]
+
+
+def _discovery_queries(body: dict, config, page: int = 1):
     from harvey.collectors.discover import build_queries
 
     cities = [c.strip() for c in (body.get("cities") or []) if c.strip()] or None
@@ -2244,6 +3066,7 @@ def _discovery_queries(body: dict, config):
         config, cities=cities, terms=terms,
         depth=int(body.get("depth") or 30),
         limit=int(body.get("limit") or 100),
+        page=page,
     )
 
 
@@ -2370,11 +3193,25 @@ async def start_discovery(request: Request):
                                 status_code=400)
 
         config = load_config()
-        queries = _discovery_queries(body, config)
-        max_spend = float(body.get("max_spend") or 1.0)
-
         state = _state()
         await state.init_db()
+
+        # Pressing the button again with the same terms and places used to
+        # re-issue the identical queries, so every result deduped away as
+        # already known and nothing new ever appeared. Unless a page is
+        # asked for explicitly, a repeat of the same search walks to the
+        # next page of results instead.
+        signature = _discovery_signature(body)
+        if body.get("page"):
+            page = max(1, int(body["page"]))
+        else:
+            seen = await state.get_setting("discovery_page_" + signature)
+            page = (int(seen) + 1) if (seen or "").isdigit() else 1
+        await state.set_setting("discovery_page_" + signature, str(page))
+
+        queries = _discovery_queries(body, config, page=page)
+        max_spend = float(body.get("max_spend") or 1.0)
+
         await state.set_setting("discovery_provider", provider)
         await state.set_setting("discovery_paused", "")
 
