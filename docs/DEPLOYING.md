@@ -61,6 +61,27 @@ means the problem is an import, usually a dependency missing from
 
 Either way no route serves data while that page is showing.
 
+### If every path returns a blank 500
+
+A `FUNCTION_INVOCATION_FAILED` with no page at all means the function
+crashed before Harvey's own error handling could run, so the entry point
+cannot tell you anything. `/probe` exists to split that question:
+
+- **`/probe` returns 200** — the runtime, the bundle and Starlette are fine,
+  so the fault is in importing Harvey. The exception is in the project's
+  **Runtime Logs**, under Deployments -> the latest one -> Functions.
+- **`/probe` returns 500 too** — nothing in this repository is at fault. No
+  function in the project can start, which points at the project's own
+  settings: a Root Directory pointing somewhere unexpected, or a framework
+  preset fighting `vercel.json`. Note that this repository currently has
+  more than one Vercel project attached to it, which is a common way to end
+  up looking at the logs of a deployment that is not the one serving the
+  domain.
+
+`/probe` imports nothing from `harvey` and serves no data, so it is safe to
+leave in place; delete `api/probe.py` and its rewrite once it has answered.
+
+
 ## A caution about the repository
 
 `Mohan0768/Harvey` is **public**, and it already tracks real contact data:
