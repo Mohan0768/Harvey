@@ -16,6 +16,7 @@ WORKDIR /app
 # then Chromium + its system libraries in the same layer cleanup pass.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir 'playwright>=1.40,<2' \
     && playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/* /root/.cache
 

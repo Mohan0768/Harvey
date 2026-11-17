@@ -1,10 +1,15 @@
-# Mirrors [project.dependencies] in pyproject.toml — keep the two in sync.
+# Mirrors [project.dependencies] in pyproject.toml, with ONE deliberate
+# difference: playwright is not here. It is 117 MB of the 185 MB a full
+# install weighs, nothing the dashboard serves imports it, and a
+# serverless build reads this file -- so every function was carrying a
+# browser automation library it never used. Hosts that need it install
+# it explicitly: the Dockerfile does, and `pip install -e .` still
+# brings it, because pyproject.toml keeps it as a real dependency.
 # Prefer `pip install -e .` for development; this file exists for Docker
 # and quick installs. Upper bounds guard against breaking major releases.
 pyyaml>=6.0.1,<7
 python-dotenv>=1.0.1,<2
 httpx>=0.27.0,<1
-playwright>=1.40,<2
 beautifulsoup4>=4.12.3,<5
 dnspython>=2.4.2,<3
 aiosmtplib>=3.0.1,<4
